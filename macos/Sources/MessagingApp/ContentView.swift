@@ -18,19 +18,22 @@ struct ContentView: View {
             }
         }
         .frame(minWidth: 420, minHeight: 500)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Solarized.base3)
     }
 
     private var connectView: some View {
         VStack(spacing: 12) {
             Text("Connect to a LAN server")
                 .font(.title2)
+                .foregroundStyle(Solarized.base01)
 
-            TextField("Server address", text: $host)
-            TextField("Port", text: $port)
-            TextField("Display name", text: $displayName)
+            themedField(placeholder: "Server address", text: $host)
+            themedField(placeholder: "Port", text: $port)
+            themedField(placeholder: "Display name", text: $displayName)
 
             if case .failed(let reason) = client.state {
-                Text(reason).foregroundStyle(.red).font(.caption)
+                Text(reason).foregroundStyle(Solarized.red).font(.caption)
             }
 
             Button("Connect") {
@@ -55,6 +58,7 @@ struct ContentView: View {
                     }
                     .padding()
                 }
+                .background(Solarized.base3)
                 .onChange(of: client.messages.count) { _ in
                     if let last = client.messages.last {
                         proxy.scrollTo(last.id, anchor: .bottom)
@@ -62,15 +66,15 @@ struct ContentView: View {
                 }
             }
 
-            Divider()
+            Divider().background(Solarized.base1)
 
             HStack {
-                TextField("Message", text: $draft)
-                    .onSubmit(sendDraft)
+                themedField(placeholder: "Message", text: $draft, onSubmit: sendDraft)
                 Button("Send", action: sendDraft)
                     .disabled(draft.isEmpty)
             }
             .padding()
+            .background(Solarized.base2)
         }
     }
 
@@ -79,14 +83,31 @@ struct ContentView: View {
             if message.isSystem {
                 Text(message.text)
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(Solarized.base1)
             } else {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(message.from).font(.caption).bold()
-                    Text(message.text)
+                    Text(message.from).font(.caption).bold().foregroundStyle(Solarized.base01)
+                    Text(message.text).foregroundStyle(Solarized.base00)
                 }
             }
         }
+    }
+
+    private func themedField(
+        placeholder: String,
+        text: Binding<String>,
+        onSubmit: (() -> Void)? = nil
+    ) -> some View {
+        TextField(placeholder, text: text)
+            .textFieldStyle(.plain)
+            .padding(8)
+            .background(Solarized.base2)
+            .foregroundStyle(Solarized.base00)
+            .overlay(
+                RoundedRectangle(cornerRadius: 6)
+                    .stroke(Solarized.base1, lineWidth: 1)
+            )
+            .onSubmit { onSubmit?() }
     }
 
     private func sendDraft() {
