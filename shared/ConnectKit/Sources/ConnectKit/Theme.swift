@@ -11,7 +11,7 @@ enum Solarized {
     static let red = Color(red: 0xdc / 255, green: 0x32 / 255, blue: 0x2f / 255)
 }
 
-extension View {
+public extension View {
     /// Applies the app's default theme (Solarized Light).
     func appTheme() -> some View {
         self

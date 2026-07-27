@@ -3,7 +3,7 @@ import PackageDescription
 
 let package = Package(
     name: "Connect",
-    platforms: [.macOS(.v13)],
+    platforms: [.iOS(.v17)],
     dependencies: [
         .package(path: "../shared/ConnectKit")
     ],

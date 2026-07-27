@@ -1,6 +1,6 @@
 import SwiftUI
 
-struct ContentView: View {
+public struct ContentView: View {
     @StateObject private var client = NetworkClient()
 
     @State private var host = "127.0.0.1"
@@ -8,7 +8,9 @@ struct ContentView: View {
     @State private var displayName = ""
     @State private var draft = ""
 
-    var body: some View {
+    public init() {}
+
+    public var body: some View {
         Group {
             switch client.state {
             case .connected:

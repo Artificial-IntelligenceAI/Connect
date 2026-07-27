@@ -3,4 +3,8 @@
 # Swift Package Manager
 /macos/.build
 /macos/.swiftpm
+/shared/ConnectKit/.build
+/ios/.build
+/ios/.swiftpm
+/ios/Connect.app
 .DS_Store
