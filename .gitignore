@@ -1,0 +1,6 @@
+/target
+
+# Swift Package Manager
+/macos/.build
+/macos/.swiftpm
+.DS_Store
