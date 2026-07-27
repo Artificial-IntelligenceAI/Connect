@@ -1,6 +1,6 @@
-# MessagingApp
+# Connect
 
-A cross-platform, end-to-end encrypted messaging app.
+A messaging app. Cross-platform and end-to-end encrypted.
 
 ## Architecture
 
