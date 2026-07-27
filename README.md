@@ -43,6 +43,24 @@ cd macos && swift run
 Connect using `127.0.0.1` / port `7878` and a display name. Run a second
 instance to chat with yourself locally.
 
+### Prebuilt app bundle
+
+`macos/MessagingApp.app` is a prebuilt debug bundle (arm64/Apple Silicon
+only) checked in for convenience — double-click it or `open
+macos/MessagingApp.app` instead of running `swift run`. It's a snapshot,
+**not rebuilt automatically**: after changing anything under
+`macos/Sources`, regenerate it with:
+
+```bash
+cd macos && swift build
+rm -rf MessagingApp.app
+mkdir -p MessagingApp.app/Contents/MacOS
+cp .build/arm64-apple-macosx/debug/MessagingApp MessagingApp.app/Contents/MacOS/
+```
+
+(`Contents/Info.plist` doesn't need to change unless the bundle identifier
+or version does.)
+
 ## License
 
 Apache License 2.0 — see [LICENSE](LICENSE).
