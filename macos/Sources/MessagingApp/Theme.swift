@@ -7,7 +7,6 @@ enum Solarized {
     static let base1 = Color(red: 0x93 / 255, green: 0xa1 / 255, blue: 0xa1 / 255)   // secondary content
     static let base00 = Color(red: 0x65 / 255, green: 0x7b / 255, blue: 0x83 / 255)  // body text
     static let base01 = Color(red: 0x58 / 255, green: 0x6e / 255, blue: 0x75 / 255)  // emphasized text
-    static let base02 = Color(red: 0x07 / 255, green: 0x36 / 255, blue: 0x42 / 255)  // borders on light bg
     static let blue = Color(red: 0x26 / 255, green: 0x8b / 255, blue: 0xd2 / 255)
     static let red = Color(red: 0xdc / 255, green: 0x32 / 255, blue: 0x2f / 255)
 }
