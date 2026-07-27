@@ -1,7 +1,7 @@
 import SwiftUI
 
 @main
-struct MessagingAppApp: App {
+struct ConnectApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView()
