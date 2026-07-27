@@ -42,6 +42,7 @@ public struct ContentView: View {
                 guard let portNumber = Int(port), !displayName.isEmpty else { return }
                 client.connect(host: host, port: portNumber, displayName: displayName)
             }
+            .buttonStyle(.borderedProminent)
             .keyboardShortcut(.defaultAction)
             .disabled(client.state == .connecting)
         }
