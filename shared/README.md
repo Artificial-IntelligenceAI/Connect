@@ -76,6 +76,51 @@ bundle finds its own embedded copy via `@executable_path` instead. Don't
 hand-copy just the executable when making a distributable bundle — use
 the scripts, or replicate what they do.
 
+## Android
+
+There's no separate `AndroidKit` package — Android's `NetworkClient.kt`
+(`android/app/src/main/java/com/messagingapp/connect/ui/NetworkClient.kt`)
+plays the same role as `ConnectKit`'s `NetworkClient.swift`, implementing
+the generated `ConnectClientListener` interface and republishing events
+as Compose state (`mutableStateOf`/`mutableStateListOf`) instead of
+`@Published`.
+
+`build-core-android.sh` is the Android equivalent of
+`build-core-apple.sh`: cross-compiles `core` for `aarch64-linux-android`
+via `cargo-ndk` (straight to `android/app/src/main/jniLibs/arm64-v8a/`,
+which Gradle's `jniLibs.srcDir` picks up automatically) and generates
+Kotlin bindings into `android/app/generated/uniffi` (added as a Gradle
+`kotlin.srcDir`). Both are gitignored, same reasoning as the Apple
+bindings — run the script before `./gradlew assembleDebug` or it'll fail
+to resolve `uniffi.messaging_core.*` imports.
+
+The generated Kotlin bindings need [JNA](https://github.com/java-native-access/jna)
+at runtime (`com.sun.jna.*` — that's how they call into the native
+`.so`); `android/app/build.gradle.kts` depends on
+`net.java.dev.jna:jna:5.14.0@aar` for this.
+
+Only `arm64-v8a` is built — matches Android Studio's default emulator
+system image on Apple Silicon Macs (arm64, no x86_64 translation
+overhead) and real Android hardware. Add `x86_64-linux-android` to both
+the rustup targets and the `cargo ndk -t` flags in
+`build-core-android.sh` if an x86_64 emulator is ever needed too.
+
+### A gotcha specific to Android: emulator networking
+
+Unlike the iOS Simulator (which shares the host Mac's network stack, so
+`127.0.0.1` reaches services on the Mac directly), the Android emulator
+runs its own virtual network. From inside the emulator, `10.0.2.2` is the
+alias for the host machine's `localhost` — use that instead of
+`127.0.0.1` when pointing the app at a relay server running on your Mac.
+
+### A gotcha specific to `adb shell input text`
+
+It splits on spaces by default (each word gets typed as if a separate
+command). Encode spaces as `%s`: `adb shell input text
+"Hello%sfrom%sAndroid"` types `Hello from Android`. Discovered the hard
+way when a message field only ever got "Hello" instead of the full test
+string.
+
 ## Adding a real iOS device target later
 
 Not done yet (deliberately deferred). Would need:

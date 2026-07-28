@@ -24,9 +24,11 @@ A messaging app. Cross-platform and end-to-end encrypted.
   `ios/` are both thin app shells that depend on it, so the UI and
   networking logic are each implemented exactly once, shared across both
   platforms.
-- **Android:** Kotlin / Jetpack Compose (not started — will bind to the
-  same Rust core via UniFFI's Kotlin bindings rather than reimplementing
-  the protocol again).
+- **Android:** Kotlin / Jetpack Compose (`android/`). Same pattern as
+  Apple: `android/app`'s `NetworkClient.kt` implements the UniFFI
+  callback interface and wraps the same Rust `ConnectClient`, cross-compiled
+  for Android via `cargo-ndk`. No protocol logic is reimplemented — see
+  [shared/README.md](shared/README.md).
 - **Windows:** C# / WinUI 3.
 - **Linux:** GTK4 (`gtk4-rs`).
 
@@ -41,6 +43,7 @@ server/             LAN relay server (Axum + WebSocket)
 shared/ConnectKit/  shared SwiftUI code + generated Rust FFI bindings (Swift Package)
 macos/              macOS app shell "Connect" (Swift Package)
 ios/                iOS/iPadOS app shell "Connect" (Swift Package)
+android/            Android app "Connect" (Gradle + Jetpack Compose)
 ```
 
 ## Running locally
@@ -103,6 +106,25 @@ scene-based lifecycle/touch delivery), signs it, and installs it on the
 given simulator. Launch it with `xcrun simctl launch <udid>
 com.messagingapp.connect.ios`, or open `ios/Package.swift` directly in
 Xcode and run it from there instead.
+
+### Running the Android app
+
+Requires the Android SDK (`platform-tools`, a platform, `emulator` + a
+system image) and NDK, plus `cargo-ndk` (`cargo install cargo-ndk`) and
+the `aarch64-linux-android` Rust target. Set `ANDROID_HOME` and
+`ANDROID_NDK_HOME`, then:
+
+```bash
+./shared/build-core-android.sh   # cross-compiles core, generates Kotlin bindings
+cd android && ./gradlew assembleDebug
+```
+
+Install and launch on a running emulator/device with `adb install -r
+android/app/build/outputs/apk/debug/app-debug.apk` and `adb shell am
+start -n com.messagingapp.connect/.MainActivity`. Note the Android
+emulator does **not** share the host's network stack the way the iOS
+Simulator does — use `10.0.2.2` instead of `127.0.0.1` to reach a relay
+server running on your Mac.
 
 ### Testing the Rust<->Swift FFI directly
 

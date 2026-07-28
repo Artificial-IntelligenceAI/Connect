@@ -11,3 +11,12 @@
 /ios/.swiftpm
 /ios/Connect.app
 .DS_Store
+
+# Android / Gradle
+/android/.gradle
+/android/.kotlin
+/android/build
+/android/app/build
+/android/app/generated
+/android/app/src/main/jniLibs
+/android/local.properties
