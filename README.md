@@ -4,25 +4,31 @@ A messaging app. Cross-platform and end-to-end encrypted.
 
 ## Architecture
 
-- **Shared core (Rust):** networking, message protocol, and (soon) E2EE via
-  [`vodozemac`](https://github.com/matrix-org/vodozemac) (Olm/Megolm ratchet).
-- **Server (Rust, Axum):** relays messages between connected clients. Runs in
-  LAN mode today (plain WebSocket, no discovery/TLS yet); a hosted "real
-  server" mode is planned, using the same protocol.
+- **Shared core (Rust, `core/`):** the actual networking client — connects
+  over WebSocket, speaks the join/message/system_notice JSON protocol, and
+  reports events back to native UIs through a
+  [UniFFI](https://mozilla.github.io/uniffi-rs/) callback interface
+  (`ConnectClient` / `ConnectClientListener`). Every platform's UI calls
+  into this same Rust implementation instead of reimplementing the
+  protocol — see [shared/README.md](shared/README.md) for how the Swift
+  bindings get generated. E2EE (via
+  [`vodozemac`](https://github.com/matrix-org/vodozemac), Olm/Megolm) is
+  not implemented yet.
+- **Server (Rust, Axum, `server/`):** relays messages between connected
+  clients. Runs in LAN mode today (plain WebSocket, no discovery/TLS yet);
+  a hosted "real server" mode is planned, using the same protocol.
 - **macOS / iOS / iPadOS:** Swift / SwiftUI. The app is named "Connect" on
   every Apple platform. `shared/ConnectKit` is a local Swift Package
-  holding the actual UI/networking code (`ContentView`, `NetworkClient`,
-  `Theme`); `macos/` and `ios/` are both thin app shells that depend on it,
-  so there is exactly one implementation of the app shared between
+  holding the actual UI (`ContentView`, `Theme`) and a thin
+  `NetworkClient` wrapper around the Rust `ConnectClient`; `macos/` and
+  `ios/` are both thin app shells that depend on it, so the UI and
+  networking logic are each implemented exactly once, shared across both
   platforms.
-- **Android:** Kotlin / Jetpack Compose.
+- **Android:** Kotlin / Jetpack Compose (not started — will bind to the
+  same Rust core via UniFFI's Kotlin bindings rather than reimplementing
+  the protocol again).
 - **Windows:** C# / WinUI 3.
 - **Linux:** GTK4 (`gtk4-rs`).
-
-Native clients are meant to share the Rust core via UniFFI bindings. The
-current macOS app is a v0 that talks to the server directly over WebSocket
-to get the pipeline working end-to-end; wiring it through the Rust core via
-UniFFI is the next step.
 
 **Encryption is not yet implemented.** Messages are currently sent in
 plaintext over the LAN relay. Do not use this for anything sensitive yet.
@@ -30,14 +36,24 @@ plaintext over the LAN relay. Do not use this for anything sensitive yet.
 ## Repo layout
 
 ```
-core/               shared Rust message types/protocol
+core/               shared Rust networking client + protocol (UniFFI-exported)
 server/             LAN relay server (Axum + WebSocket)
-shared/ConnectKit/  shared SwiftUI code (Swift Package), used by both apps below
+shared/ConnectKit/  shared SwiftUI code + generated Rust FFI bindings (Swift Package)
 macos/              macOS app shell "Connect" (Swift Package)
 ios/                iOS/iPadOS app shell "Connect" (Swift Package)
 ```
 
 ## Running locally
+
+The Rust core has to be built and its Swift bindings generated *before*
+either app will build — see [shared/README.md](shared/README.md) for
+what that step does. tl;dr:
+
+```bash
+./shared/build-core-apple.sh
+```
+
+Then:
 
 ```bash
 # Terminal 1: start the relay server
@@ -55,50 +71,51 @@ instance to chat with yourself locally.
 `macos/Connect.app` is a prebuilt debug bundle (arm64/Apple Silicon only)
 checked in for convenience — double-click it or `open macos/Connect.app`
 instead of running `swift run`. It's a snapshot, **not rebuilt
-automatically**: after changing anything under `macos/Sources` or
-`shared/ConnectKit`, regenerate it with:
+automatically**: after changing anything under `macos/Sources`,
+`shared/ConnectKit`, or `core/`, regenerate it with:
 
 ```bash
-cd macos && swift build
-rm -rf Connect.app
-mkdir -p Connect.app/Contents/MacOS
-cp .build/arm64-apple-macosx/debug/Connect Connect.app/Contents/MacOS/
+./shared/build-core-apple.sh   # if core/ changed
+cd macos && ./build-app.sh
 ```
 
-(`Contents/Info.plist` doesn't need to change unless the bundle identifier
-or version does.)
+`build-app.sh` also embeds `libmessaging_core.dylib` inside the bundle and
+rewrites its load path to be relative to the bundle (`swift build` alone
+links it by the absolute path in `target/`, which only works on the
+machine that built it).
 
 ### Running the iOS app
 
 Requires full Xcode (not just Command Line Tools) with an iOS Simulator
-runtime installed. `ios/` has no `.xcodeproj` — `xcodebuild` can build
-straight from `Package.swift`:
+runtime installed. `ios/` has no `.xcodeproj` — `xcodebuild` builds
+straight from `Package.swift`. Get a simulator's UDID from `xcrun simctl
+list devices`, then:
 
 ```bash
-cd ios
-xcodebuild -scheme Connect -destination 'platform=iOS Simulator,name=iPhone 17' build
+./shared/build-core-apple.sh   # if core/ changed
+cd ios && ./build-app.sh <simulator-udid>
 ```
 
-That produces a bare executable (not an `.app`), since SwiftPM executable
-targets aren't iOS app bundles on their own. Wrap and install it with:
+This builds, wraps the executable into a self-contained `.app` (same
+dylib-embedding treatment as the macOS script, plus an `Info.plist` with
+`UIApplicationSceneManifest`, which SwiftUI's `WindowGroup` needs for
+scene-based lifecycle/touch delivery), signs it, and installs it on the
+given simulator. Launch it with `xcrun simctl launch <udid>
+com.messagingapp.connect.ios`, or open `ios/Package.swift` directly in
+Xcode and run it from there instead.
+
+### Testing the Rust<->Swift FFI directly
+
+`shared/ConnectKit`'s `FFISmokeTest` target is a small CLI that calls
+`MessagingCore.ConnectClient` directly (bypassing all UI) — connects,
+sends one message, and prints everything the Rust core reports back.
+Useful for verifying the FFI layer itself, or for testing on iOS via
+`xcrun simctl spawn <udid> <path-to-built-binary>` since it needs no
+Simulator UI interaction at all:
 
 ```bash
-BINARY=$(find ~/Library/Developer/Xcode/DerivedData/ios-*/Build/Products/Debug-iphonesimulator/Connect -type f | head -1)
-rm -rf Connect.app && mkdir Connect.app
-cp "$BINARY" Connect.app/Connect
-cp Info.plist.template Connect.app/Info.plist   # see below
-codesign --force --sign - Connect.app
-xcrun simctl install booted Connect.app
-xcrun simctl launch booted com.messagingapp.connect.ios
+cd shared/ConnectKit && swift run FFISmokeTest
 ```
-
-There's no `Info.plist.template` checked in yet -- copy the `Info.plist` an
-Xcode-generated iOS app target produces (it needs `CFBundleExecutable`,
-`CFBundleIdentifier`, `UILaunchScreen`, and critically
-`UIApplicationSceneManifest`, which SwiftUI's `WindowGroup` relies on for
-scene-based touch delivery). The easiest path if you hit trouble: open
-`ios/Package.swift` directly in Xcode and run it from there instead of the
-command line.
 
 ## License
 

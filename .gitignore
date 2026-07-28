@@ -4,6 +4,9 @@
 /macos/.build
 /macos/.swiftpm
 /shared/ConnectKit/.build
+/shared/ConnectKit/.swiftpm
+/shared/ConnectKit/MessagingCoreFFI.xcframework
+/shared/ConnectKit/Sources/MessagingCore
 /ios/.build
 /ios/.swiftpm
 /ios/Connect.app

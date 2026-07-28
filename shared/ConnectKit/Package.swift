@@ -8,9 +8,24 @@ let package = Package(
         .library(name: "ConnectKit", targets: ["ConnectKit"])
     ],
     targets: [
+        .binaryTarget(
+            name: "MessagingCoreFFI",
+            path: "MessagingCoreFFI.xcframework"
+        ),
+        .target(
+            name: "MessagingCore",
+            dependencies: ["MessagingCoreFFI"],
+            path: "Sources/MessagingCore"
+        ),
         .target(
             name: "ConnectKit",
+            dependencies: ["MessagingCore"],
             path: "Sources/ConnectKit"
+        ),
+        .executableTarget(
+            name: "FFISmokeTest",
+            dependencies: ["MessagingCore"],
+            path: "Sources/FFISmokeTest"
         )
     ]
 )

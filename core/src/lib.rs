@@ -1,5 +1,10 @@
 use serde::{Deserialize, Serialize};
 
+uniffi::setup_scaffolding!();
+
+mod client;
+pub use client::{ChatMessage, ConnectClient, ConnectClientListener, ConnectionState};
+
 /// Messages sent from a client to the server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
