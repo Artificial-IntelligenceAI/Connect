@@ -105,7 +105,10 @@ private fun ChatScreen(client: NetworkClient) {
 
     LaunchedEffect(client.messages.size) {
         if (client.messages.isNotEmpty()) {
-            listState.animateScrollToItem(client.messages.size - 1)
+            // Not animateScrollToItem: an animated scroll racing the IME's
+            // window-resize animation can land mid-flight, leaving the list
+            // scrolled past its content until the next recomposition.
+            listState.scrollToItem(client.messages.size - 1)
         }
     }
 
