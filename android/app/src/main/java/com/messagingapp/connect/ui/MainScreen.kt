@@ -138,7 +138,7 @@ private fun ChatScreen(client: NetworkClient) {
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             items(client.messages) { message ->
-                if (message.isSystem) {
+                if (message.conversation == Conversation.System) {
                     Text(
                         message.text,
                         color = Solarized.base1,
@@ -160,6 +160,9 @@ private fun ChatScreen(client: NetworkClient) {
 
         HorizontalDivider(color = Solarized.base1)
 
+        // Disabled until the chat-list GUI exists: sending now needs a
+        // peer or group to target, which this single free-text composer
+        // has no way to express.
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -183,13 +186,8 @@ private fun ChatScreen(client: NetworkClient) {
             )
             Spacer(Modifier.width(8.dp))
             Button(
-                onClick = {
-                    if (draft.isNotEmpty()) {
-                        client.send(draft)
-                        draft = ""
-                    }
-                },
-                enabled = draft.isNotEmpty(),
+                onClick = {},
+                enabled = false,
                 colors = ButtonDefaults.buttonColors(containerColor = Solarized.blue)
             ) {
                 Text("Send")

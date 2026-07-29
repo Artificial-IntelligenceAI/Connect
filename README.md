@@ -11,17 +11,20 @@ A messaging app. Cross-platform and end-to-end encrypted.
   UI calls into this same Rust implementation instead of reimplementing
   the protocol — see [shared/README.md](shared/README.md) for how the
   Swift/Kotlin bindings get generated.
-- **End-to-end encryption is implemented**, via
-  [`vodozemac`](https://github.com/matrix-org/vodozemac) — the same
-  Olm (pairwise)/Megolm (group) design Matrix uses. Each client has a
-  persistent Olm identity (see below), uses it to privately hand every
-  other peer in the room its Megolm session key, then encrypts actual
-  chat messages with Megolm once per send rather than once per recipient.
-  The server only ever relays ciphertext for message/key-exchange traffic
-  — see `core/src/client.rs` for the full design and its documented v1
-  limitations (one-time keys are reused across peers rather than consumed
-  once each, and a message can arrive before its key exchange completes
-  and be silently dropped rather than retried).
+- **Real, end-to-end encrypted 1:1 DMs and group chats**, via
+  [`vodozemac`](https://github.com/matrix-org/vodozemac)'s Olm (pairwise,
+  X3DH-style double ratchet). There's no implicit shared "room" — every
+  conversation is either an explicit 1:1 with one other peer or an
+  explicit, named, fixed-membership group chat, and both are built on the
+  same per-peer Olm sessions (a group message is just the same encrypted
+  payload fanned out individually to each currently-online member, not a
+  shared group key). The server only ever relays ciphertext, addressed by
+  peer ID — see `core/src/client.rs` for the full design and its
+  documented v1 limitations (one-time keys are reused across peers rather
+  than consumed once each, group membership is fixed at creation from
+  currently-online peers only, and a message can arrive before its
+  sender's Olm session is ready and be silently dropped rather than
+  retried).
 - **Identity is persisted, with trust-on-first-use key-change warnings.**
   Each `ConnectClient` is constructed with a `data_dir` (a platform-
   supplied, sandboxed writable directory); its Olm identity is pickled to
@@ -40,20 +43,22 @@ A messaging app. Cross-platform and end-to-end encrypted.
   restart, wifi hiccup, or laptop sleep/wake no longer leaves the app
   stuck showing "Connected" over a dead socket: the client reports a new
   `Reconnecting` state and retries (1s, 2s, 4s, ... capped at 30s) until
-  it succeeds, re-establishing encrypted sessions with whoever's still in
-  the room. A user-initiated disconnect is distinct from a drop and does
-  not retry. Messages sent while reconnecting are queued and delivered
-  once the connection comes back, not lost. See "Reconnection handling"
-  in [shared/README.md](shared/README.md) for the full design, including
-  a real bug caught during testing (a drop with no message in flight went
+  it succeeds. A user-initiated disconnect is distinct from a drop and
+  does not retry. Note a reconnect (yours or a peer's) does reset the Olm
+  sessions used for DMs/group messages, so a conversation mid-drop
+  re-bootstraps its session next time either side sends something rather
+  than picking up mid-ratchet. See "Reconnection handling" in
+  [shared/README.md](shared/README.md) for the full design, including a
+  real bug caught during testing (a drop with no message in flight went
   undetected until the read side was watched too, not just writes).
 - **Server (Rust, Axum, `server/`):** routes ciphertext between connected
-  clients — broadcasts chat messages and peer-joined/left events to the
-  room, and delivers key-exchange messages point-to-point to the specific
-  peer they're addressed to. It knows who's in the room and who's talking
-  to whom, but never has the keys to read message content. Runs in LAN
-  mode today (no discovery/TLS yet); a hosted "real server" mode is
-  planned, using the same protocol.
+  clients — broadcasts peer-joined/left events for discovery, and relays
+  1:1 messages, group invites, and group messages point-to-point to the
+  specific peer(s) they're addressed to. It knows who's online and who's
+  talking to whom, but never has the keys to read any content, and has no
+  notion of conversations or groups itself — clients tell it exactly who
+  to deliver each ciphertext to. Runs in LAN mode today (no discovery/TLS
+  yet); a hosted "real server" mode is planned, using the same protocol.
 - **macOS / iOS / iPadOS:** Swift / SwiftUI. The app is named "Connect" on
   every Apple platform. `shared/ConnectKit` is a local Swift Package
   holding the actual UI (`ContentView`, `Theme`) and a thin
@@ -100,8 +105,17 @@ cargo run -p messaging-server
 cd macos && swift run
 ```
 
-Connect using `127.0.0.1` / port `7878` and a display name. Run a second
-instance to chat with yourself locally.
+Connect using `127.0.0.1` / port `7878` and a display name.
+
+**The message composer is currently disabled on all three platforms.**
+Sending now requires targeting a specific peer or group
+(`sendDirectMessage`/`createGroup`/`sendGroupMessage`), and the existing
+single connect-then-chat screen has no UI for picking one — that's the
+chat-list GUI planned next. Until then, the connect flow, roster/TOFU
+system notices, and reconnection banner all still work and are worth
+trying; sending a message from the UI is not. See [shared/ConnectKit's
+test suite](shared/README.md#automated-tests) or `core/src/client.rs`'s
+own tests to see DMs/groups actually exercised today.
 
 ### Prebuilt macOS app bundle
 
@@ -160,21 +174,21 @@ emulator does **not** share the host's network stack the way the iOS
 Simulator does — use `10.0.2.2` instead of `127.0.0.1` to reach a relay
 server running on your Mac.
 
-### Testing the Rust<->Swift FFI (and E2EE) directly
+### Testing the Rust<->Swift FFI directly
 
 `shared/ConnectKit`'s `FFISmokeTest` target is a small CLI that calls
-`MessagingCore.ConnectClient` directly (bypassing all UI) — connects,
-sends one message, and prints everything the Rust core reports back,
-including any messages it receives from other peers (run two at once
-with different display names to see real encrypted delivery between
-them, not just a local echo). Useful for verifying the FFI/crypto layer
-itself without fighting a GUI, or for testing on iOS via `xcrun simctl
-spawn <udid> <path-to-built-binary>` since it needs no Simulator UI
-interaction at all. Identity persists per `dataDirTag` (defaults to
-`displayName`) under a temp directory — run twice with the same tag to
-confirm persistence (same fingerprint printed both times), or with the
-same `displayName` but a different tag to trigger the key-changed
-warning:
+`MessagingCore.ConnectClient` directly (bypassing all UI) — connects and
+prints everything the Rust core reports back (fingerprint, TOFU notices,
+join/leave), useful for confirming two instances discover each other
+without fighting a GUI, or for testing on iOS via `xcrun simctl spawn
+<udid> <path-to-built-binary>` since it needs no Simulator UI interaction
+at all. It doesn't exercise sending a DM/group message — that needs a
+live peer ID this simple listener interface has no query API for yet; see
+`core/src/client.rs`'s own test suite for DM/group send+receive exercised
+directly. Identity persists per `dataDirTag` (defaults to `displayName`)
+under a temp directory — run twice with the same tag to confirm
+persistence (same fingerprint printed both times), or with the same
+`displayName` but a different tag to trigger the key-changed warning:
 
 ```bash
 cd shared/ConnectKit && swift run FFISmokeTest [displayName] [host] [port] [dataDirTag]

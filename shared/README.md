@@ -23,31 +23,37 @@ A local Swift Package (`ConnectKit/`) with three targets:
 
 ## Automated tests
 
-`cargo test --workspace` runs everything below (23 tests as of this
-writing: 17 in `messaging-core`, 6 in `messaging-server`). Two different
+`cargo test --workspace` runs everything below (26 tests as of this
+writing: 20 in `messaging-core`, 6 in `messaging-server`). Two different
 styles are used deliberately, at different layers:
 
 ### `core/src` -- fast, no sockets
 
 `core/src/client.rs` and `core/src/persistence.rs` each have a
 `#[cfg(test)] mod tests` at the bottom testing crypto/protocol logic
-directly: plain functions (`handle_new_peer`, `handle_key_exchange`,
-`decrypt_message`, `backoff_delay`, `reset_peer_state`, ...) that take a
-`SharedCrypto` directly, called the same way `connect()`'s event loop
-does, just without a socket in between. These run in milliseconds.
+directly: plain functions (`handle_new_peer`, `olm_decrypt`,
+`handle_direct_message`, `handle_group_invite`, `handle_group_message`,
+`backoff_delay`, `reset_peer_state`, ...) that take a `SharedCrypto`
+directly, called the same way `connect()`'s event loop does, just without
+a socket in between. These run in milliseconds.
 
-- **`client.rs`**: a full two-party Olm handshake + bidirectional Megolm
-  message roundtrip (`full_handshake_and_message_roundtrip_both_directions`
-  -- this is the scenario the outbound/inbound-session-map bug from the
-  original E2EE implementation would have broken); all three TOFU
-  outcomes (new contact, unchanged key on reconnect, changed key
+- **`client.rs`**: a 1:1 message roundtrip across *several* messages sent
+  before any reply (`direct_message_roundtrip_survives_several_messages_before_any_reply`
+  -- catches a ratchet-advance bug a single one-shot exchange wouldn't); a
+  group create/invite/message roundtrip among three parties, confirming a
+  non-invited peer never learns the group exists
+  (`group_invite_and_message_roundtrip_among_three_parties` -- this is the
+  scenario the outbound/inbound-session-map bug from the original E2EE
+  implementation would have broken, now generalized to groups); all three
+  TOFU outcomes (new contact, unchanged key on reconnect, changed key
   warning); `backoff_delay`'s growth/cap; `sleep_or_cancel`'s two exit
   paths; `reset_peer_state` clearing peer maps but not identity.
 - **`persistence.rs`**: identity persists across repeated
   `load_or_create_account` calls against the same `data_dir` and differs
-  across different dirs; `known_peers.json` round-trips; missing files
-  default to empty rather than erroring; `format_fingerprint`'s chunking,
-  including odd lengths and the empty string.
+  across different dirs; `known_peers.json`/`groups.json` round-trip;
+  missing files default to empty rather than erroring;
+  `format_fingerprint`'s chunking, including odd lengths and the empty
+  string.
 
 Tests that touch disk use `std::env::temp_dir()` with a `Uuid::new_v4()`
 suffix per test (not a shared fixture directory) so they can run
@@ -95,11 +101,12 @@ only uses axum's built-in `extract::ws` types). One plain unit test
 checks the exclusion logic directly against in-memory channels; the rest
 are full protocol round-trips through real WebSocket connections:
 joining alone gets an empty roster; a second joiner sees the first in
-their roster and the first gets `PeerJoined`; a chat message reaches
-other peers but never echoes back to its sender; a `KeyExchange`
-reaches only its named `to` target, not bystanders; disconnecting
-broadcasts `PeerLeft` to the room. Every `recv()` in these tests is
-timeout-bounded for the same reason as above.
+their roster and the first gets `PeerJoined`; a `DirectMessage` reaches
+only its named target, never a bystander, and never echoes back to its
+sender; a `GroupInvite` and the `GroupMessage`s that follow reach only
+the invited recipient, not a bystander; disconnecting broadcasts
+`PeerLeft`. Every `recv()` in these tests is timeout-bounded for the
+same reason as above.
 
 Together, the three layers are complementary, not redundant: the fast
 unit tests catch crypto/protocol logic bugs without any networking
@@ -109,58 +116,88 @@ connection; `FFISmokeTest` (see below and the root README) remains the
 only thing that proves the full stack -- real client, real server, real
 platform FFI bindings -- works together end to end.
 
-## End-to-end encryption (`core/src/client.rs`)
+## End-to-end encryption: real 1:1 DMs and group chats (`core/src/client.rs`)
 
-Implemented via [`vodozemac`](https://github.com/matrix-org/vodozemac),
-the same Olm/Megolm design Matrix uses. This is entirely internal to
-`ConnectClient` — the FFI surface (`ChatMessage`, `ConnectionState`,
-`ConnectClientListener`) never changed when this was added, and no
-platform's UI code needed a single line changed either. That's the
+Implemented via [`vodozemac`](https://github.com/matrix-org/vodozemac)'s
+Olm (pairwise, X3DH-style double ratchet) -- this is entirely internal to
+`ConnectClient`, the FFI surface changes being just additive new methods
+(`sendDirectMessage`/`createGroup`/`sendGroupMessage`) and a typed
+`Conversation` tag on `ChatMessage`, not a UI-layer redesign. That's the
 payoff of the UniFFI architecture: encryption is a Rust-core concern, not
 a per-platform one.
 
-**Protocol**, per connection:
+**This app has no implicit "room" anymore.** Earlier versions folded
+every connected peer into one always-on broadcast chat (Megolm, the same
+group-ratchet primitive Matrix uses for rooms). That's gone. Everything
+now is either an explicit 1:1 conversation or an explicit, named,
+fixed-membership group chat -- and both are built on the *same* per-peer
+Olm sessions, not a shared group key:
 
 1. On `connect()`, the client loads its persisted `vodozemac::olm::Account`
-   (Curve25519 identity + Ed25519 signing key) from `data_dir` -- creating
-   and saving a new one on first-ever launch -- generates one fresh Olm
-   one-time key for this connection, and creates a Megolm `GroupSession`
-   for messages it's about to send. The identity key and one-time key
-   (both base64) go out in the `Join` message. See "Identity persistence
-   and verification" below for the persistence/TOFU design.
+   from `data_dir` (see "Identity persistence" below) and its persisted
+   group metadata (`groups.json`). No Megolm session is created here
+   anymore -- there's nothing to broadcast by default.
 2. The server tracks connected peers and their published keys
-   (`PeerInfo`), and on join sends the new client a `Roster` of everyone
-   already in the room, and broadcasts a `PeerJoined` to everyone else.
-   Both cases funnel into the same `handle_new_peer` path client-side.
-3. For every peer it learns about, a client uses `Account::
-   create_outbound_session` (X3DH-style, consuming that peer's published
-   one-time key) to open a pairwise Olm session to them, encrypts its
-   *own* Megolm session key through it, and sends that as a `KeyExchange`
-   -- addressed to that one peer specifically, not broadcast. The server
-   routes `KeyExchange` point-to-point by peer ID; it's the only
-   non-broadcast message type.
-4. Receiving a `KeyExchange`: if it's the first message from that peer,
-   `Account::create_inbound_session` establishes the inbound Olm session
-   from their PreKey message; otherwise reuse the existing one. Either
-   way, decrypting it yields the sender's Megolm session key, which
-   becomes an `InboundGroupSession` keyed by their peer ID.
-5. Actual chat messages are Megolm-encrypted once (`GroupSession::
-   encrypt`) and broadcast -- every peer with an `InboundGroupSession` for
-   that sender can decrypt the same ciphertext, no per-recipient
-   encryption needed. The server's broadcast explicitly excludes the
-   sender (`broadcast_except` in `server/src/main.rs`), so `send()` also
-   locally echoes the plaintext straight to the listener rather than
-   round-tripping through a self-decrypt.
+   (`PeerInfo`), sending a new client a `Roster` of everyone already
+   online and broadcasting `PeerJoined`/`PeerLeft` to everyone else. Both
+   funnel into `handle_new_peer` client-side, which does two things and
+   sends nothing over the network: trust-on-first-use checking (see
+   below) and locally preparing an outbound Olm session to that peer via
+   `Account::create_outbound_session` (X3DH-style, consuming their
+   published one-time key). Peer discovery and conversation-starting are
+   now fully decoupled -- nothing is sent just because you learned about
+   someone.
+3. **1:1 messages** (`send_direct_message`): Olm-encrypt the text on the
+   prepared `outbound_olm_sessions[peer_id]` session and send it as a
+   `DirectMessage`, addressed to that one peer. Repeated sends keep
+   advancing the same ratchet -- this is ordinary continuous Olm usage,
+   not a one-shot handshake.
+4. **Group chats**: `create_group(name, member_peer_ids)` persists the
+   group (`groups.json`) and, for each member, Olm-encrypts
+   `{name, members}` and sends it as a `GroupInvite`. A member who
+   receives one persists the same metadata locally. `send_group_message`
+   Olm-encrypts the text once *per currently-resolvable member*
+   (`peer_id_by_identity` maps each member's stable identity to whatever
+   peer_id they're currently using) and sends one `GroupMessage` per
+   recipient. **There is no shared group key or Megolm session for
+   groups** -- a group message is just N parallel 1:1 messages, tagged
+   with a `group_id`. That trades O(1) encryption per send for
+   O(members), which is irrelevant at this app's scale and avoids an
+   entire class of key-distribution/mesh-convergence complexity a shared
+   group key would need. Worth revisiting only if group sizes ever
+   matter.
+5. Receiving any of `DirectMessage`/`GroupInvite`/`GroupMessage`: all
+   three share one decrypt helper, `olm_decrypt`, which bootstraps an
+   inbound Olm session via `Account::create_inbound_session` if this is
+   the first message ever received from that peer (a PreKeyMessage), or
+   reuses the existing inbound session otherwise. There's no dedicated
+   handshake message anymore -- *any* of the three can legitimately be
+   the first thing a fresh session carries.
 
 **A bug worth remembering if this code gets touched again:** the Olm
-session used to *encrypt* a `KeyExchange` to a peer and the one used to
-*decrypt* their `KeyExchange` back are different `Session` objects, even
-though they're "with" the same peer -- collapsing them into one
-`HashMap<PeerId, Session>` means decrypt silently uses the wrong session
-and fails. `CryptoState` keeps them in two separate maps
-(`outbound_olm_sessions` / `inbound_olm_sessions`) specifically because
-of this; it was the actual root cause the first time this was end-to-end
-tested and messages silently weren't arriving.
+session used to *send* something to a peer and the one used to *decrypt*
+what they send back are different `Session` objects, even though they're
+"with" the same peer -- collapsing them into one `HashMap<PeerId,
+Session>` means decrypt silently uses the wrong session and fails.
+`CryptoState` keeps them in two separate maps (`outbound_olm_sessions` /
+`inbound_olm_sessions`) specifically because of this; it was the actual
+root cause the first time this was end-to-end tested (against the old
+Megolm room design) and messages silently weren't arriving. The same two
+maps are now shared by 1:1 messages, group invites, and group messages
+alike.
+
+**Known, deliberate v1 limitations:**
+- Group membership is fixed at creation time, chosen from currently-online
+  peers only -- no inviting someone offline, no adding a member later.
+- A DM or group chat only works between peers connected to the same relay
+  server at the same time -- consistent with the app's existing LAN-only,
+  single-server-per-session design.
+- Per-peer Olm sessions (used for DMs and group messages alike) are
+  cleared by `reset_peer_state` on every reconnect, yours or theirs -- a
+  dropped connection mid-conversation means the session re-bootstraps
+  from scratch next time either side sends something, and anything sent
+  in that exact window can be silently dropped. Same accepted class of
+  race as the one below, just extended to cover DMs/groups too.
 
 ## Identity persistence and verification (`core/src/persistence.rs`)
 
@@ -191,8 +228,8 @@ chunks for readability (`format_fingerprint`) -- not a hash-based safety
 number like Signal/Matrix compute from *both* parties' keys, just the raw
 key formatted for a human to eyeball or read aloud. Both your own
 fingerprint (shown once per `connect()`) and a new/changed contact's are
-delivered as ordinary `ChatMessage { is_system: true }` values -- no new
-FFI surface, no new UI code on any platform, they just show up in the
+delivered as ordinary `ChatMessage { conversation: Conversation::System,
+... }` values -- no new UI code on any platform, they just show up in the
 existing chat-message list like a join/leave notice does.
 
 Both JSON files are **unencrypted at rest** -- protection is entirely
@@ -220,18 +257,15 @@ correctly triggers the key-changed warning on the second connection.
   same key gets reused across them. Not a break of the protocol's core
   security, but it gives up some of the forward-secrecy/deniability
   benefit one-time-key freshness is meant to provide.
-- No retry or buffering if a chat message arrives before its sender's
-  `KeyExchange` has been processed -- `decrypt_message` just returns
-  `None` and the message is silently dropped, rather than being queued
-  and retried once the key shows up. In practice this is a narrow race
-  (key exchange happens immediately on learning about a peer, before any
-  message would normally be sent), but it's a real gap, not a
-  theoretical one -- it was directly observed during testing.
-- No group re-keying: this is fine for a single persistent room where
-  membership is just "who's currently connected," but there's no
-  mechanism to rotate the Megolm session (e.g. to exclude a peer who left
-  from decrypting anything sent after they left) -- a peer who
-  disconnects still holds whatever Megolm keys they'd already received.
+- No retry or buffering if a message arrives before its sender's inbound
+  Olm session has been bootstrapped (needs their identity_key already
+  known via Roster/PeerJoined) -- `olm_decrypt` just returns `None` and
+  the message is silently dropped, rather than being queued and retried.
+  In practice this is a narrow race (peer discovery and outbound-session
+  prep happen synchronously in `handle_new_peer`, before any UI could let
+  you message someone), but it's a real gap, not a theoretical one -- it
+  was directly observed during testing of the original room design and is
+  now inherited by DMs and group messages too.
 
 ## Reconnection handling (`core/src/client.rs`)
 
@@ -270,19 +304,22 @@ retry loop, not a one-shot attempt:
   -- when the read side ends for any reason (EOF, error, or explicit
   abort), that's treated as a disconnect exactly like a failed write.
 - On every reconnect (not the first connect), `reset_peer_state` clears
-  the in-memory peer maps (`peer_identity_keys`, Olm/Megolm session maps)
-  before rejoining. The server assigns a fresh `PeerId` per connection, so
-  the old entries are keyed by IDs nobody will use again, and the
-  `Roster` the server sends right after rejoining repopulates everything
-  from scratch anyway. The identity `Account` and outbound Megolm
-  session are *not* reset -- they're what let a peer who already has our
-  key skip re-establishing a session with us after a blip on our end.
-- Messages sent while `Reconnecting` aren't dropped -- `send()` still
-  pushes onto the same unbounded `mpsc` channel the write loop drains, so
-  anything typed during an outage just sits queued and goes out the
-  moment the write loop resumes after a successful reconnect. This falls
-  out of the existing channel design for free; it wasn't a separate
-  feature to build.
+  the in-memory peer maps (`peer_identity_keys`, `peer_id_by_identity`,
+  the Olm session maps) before rejoining. The server assigns a fresh
+  `PeerId` per connection, so the old entries are keyed by IDs nobody will
+  use again, and the `Roster` the server sends right after rejoining
+  repopulates everything from scratch anyway. The identity `Account` and
+  persisted group metadata (`groups`) are *not* reset -- membership
+  survives a reconnect even though the Olm sessions used to reach members
+  need to re-bootstrap.
+- One consequence worth knowing: calling `send_direct_message`/
+  `send_group_message` *during* a `Reconnecting` window silently does
+  nothing, rather than queuing -- `reset_peer_state` already cleared the
+  outbound Olm session for that peer, and there's no session to encrypt
+  with until the retry succeeds and `handle_new_peer` re-preps one from
+  the fresh `Roster`. This is the same accepted race documented under
+  "End-to-end encryption" above, just triggered by a drop instead of a
+  timing race on first contact.
 
 Verified via `FFISmokeTest`: killed a running relay server mid-session
 with no message in flight, watched `[state] reconnecting(attempt: N)`

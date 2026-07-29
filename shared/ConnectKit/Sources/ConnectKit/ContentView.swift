@@ -79,10 +79,13 @@ public struct ContentView: View {
 
             Divider().background(Solarized.base1)
 
+            // Disabled until the chat-list GUI exists: sending now needs a
+            // peer or group to target, which this single free-text
+            // composer has no way to express.
             HStack {
                 themedField(placeholder: "Message", text: $draft, onSubmit: sendDraft)
                 Button("Send", action: sendDraft)
-                    .disabled(draft.isEmpty)
+                    .disabled(true)
             }
             .padding()
             .background(Solarized.base2)
@@ -91,7 +94,7 @@ public struct ContentView: View {
 
     private func messageRow(_ message: ChatMessage) -> some View {
         Group {
-            if message.isSystem {
+            if message.conversation == .system {
                 Text(message.text)
                     .font(.caption)
                     .foregroundStyle(Solarized.base1)
@@ -122,8 +125,6 @@ public struct ContentView: View {
     }
 
     private func sendDraft() {
-        guard !draft.isEmpty else { return }
-        client.send(text: draft)
-        draft = ""
+        // No-op for now -- see the composer's disabled state above.
     }
 }

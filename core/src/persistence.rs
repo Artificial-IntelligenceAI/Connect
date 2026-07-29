@@ -2,7 +2,10 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
+use serde::{Deserialize, Serialize};
 use vodozemac::olm::Account;
+
+use crate::GroupId;
 
 /// Deliberately unencrypted-at-rest: relies entirely on the OS-level
 /// sandboxing of the directory the platform layer hands us (app support dir
@@ -12,6 +15,7 @@ use vodozemac::olm::Account;
 /// trust the directory.
 const IDENTITY_FILE: &str = "identity.json";
 const KNOWN_PEERS_FILE: &str = "known_peers.json";
+const GROUPS_FILE: &str = "groups.json";
 
 pub fn load_or_create_account(data_dir: &str) -> Account {
     let path = Path::new(data_dir).join(IDENTITY_FILE);
@@ -48,6 +52,38 @@ pub fn save_known_peers(data_dir: &str, peers: &HashMap<String, String>) {
     let _ = fs::create_dir_all(data_dir);
     if let Ok(json) = serde_json::to_string(peers) {
         let _ = fs::write(Path::new(data_dir).join(KNOWN_PEERS_FILE), json);
+    }
+}
+
+/// A group chat's persisted metadata -- who's in it and what it's called.
+/// Deliberately doesn't include any Olm/Megolm session state: group
+/// messages ride the same per-peer Olm sessions DMs use, and those get
+/// re-established lazily (see `handle_new_peer` in client.rs) as members
+/// come back online, so there's nothing crypto-related worth pickling
+/// across restarts here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupMember {
+    pub identity_key: String,
+    pub display_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupMetadata {
+    pub name: String,
+    pub members: Vec<GroupMember>,
+}
+
+pub fn load_groups(data_dir: &str) -> HashMap<GroupId, GroupMetadata> {
+    fs::read_to_string(Path::new(data_dir).join(GROUPS_FILE))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_groups(data_dir: &str, groups: &HashMap<GroupId, GroupMetadata>) {
+    let _ = fs::create_dir_all(data_dir);
+    if let Ok(json) = serde_json::to_string(groups) {
+        let _ = fs::write(Path::new(data_dir).join(GROUPS_FILE), json);
     }
 }
 
@@ -126,5 +162,34 @@ mod tests {
     fn load_known_peers_defaults_to_empty_when_nothing_saved_yet() {
         let dir = temp_dir("no-peers-yet");
         assert!(load_known_peers(&dir).is_empty());
+    }
+
+    #[test]
+    fn groups_round_trip_through_disk() {
+        let dir = temp_dir("groups");
+        let mut groups = HashMap::new();
+        groups.insert(
+            "group-1".to_string(),
+            GroupMetadata {
+                name: "Family".to_string(),
+                members: vec![
+                    GroupMember { identity_key: "alice-key".into(), display_name: "Alice".into() },
+                    GroupMember { identity_key: "bob-key".into(), display_name: "Bob".into() },
+                ],
+            },
+        );
+
+        save_groups(&dir, &groups);
+        let loaded = load_groups(&dir);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded["group-1"].name, "Family");
+        assert_eq!(loaded["group-1"].members.len(), 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_groups_defaults_to_empty_when_nothing_saved_yet() {
+        let dir = temp_dir("no-groups-yet");
+        assert!(load_groups(&dir).is_empty());
     }
 }

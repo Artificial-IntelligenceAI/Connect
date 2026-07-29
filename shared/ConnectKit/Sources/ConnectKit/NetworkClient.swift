@@ -1,11 +1,17 @@
 import Foundation
 import MessagingCore
 
+enum Conversation: Equatable {
+    case system
+    case direct(peerIdentityKey: String)
+    case group(groupId: String, groupName: String)
+}
+
 struct ChatMessage: Identifiable {
     let id = UUID()
     let from: String
     let text: String
-    let isSystem: Bool
+    let conversation: Conversation
 }
 
 enum ConnectionState: Equatable {
@@ -45,8 +51,19 @@ final class NetworkClient: ObservableObject {
         client.connect(host: host, port: portNumber, displayName: displayName, listener: listener)
     }
 
-    func send(text: String) {
-        client.send(text: text)
+    func sendDirectMessage(peerId: String, text: String) {
+        client.sendDirectMessage(peerId: peerId, text: text)
+    }
+
+    /// Creates a group with `memberPeerIds` (currently-online peers only)
+    /// and invites each of them. Returns the new group's id, or `nil` if
+    /// not connected or none of the member ids resolved to a known peer.
+    func createGroup(name: String, memberPeerIds: [String]) -> String? {
+        client.createGroup(name: name, memberPeerIds: memberPeerIds)
+    }
+
+    func sendGroupMessage(groupId: String, text: String) {
+        client.sendGroupMessage(groupId: groupId, text: text)
     }
 
     func disconnect() {
@@ -71,7 +88,16 @@ final class NetworkClient: ObservableObject {
     }
 
     fileprivate func handleMessage(_ message: MessagingCore.ChatMessage) {
-        messages.append(ChatMessage(from: message.from, text: message.text, isSystem: message.isSystem))
+        let conversation: Conversation
+        switch message.conversation {
+        case .system:
+            conversation = .system
+        case .direct(let peerIdentityKey):
+            conversation = .direct(peerIdentityKey: peerIdentityKey)
+        case .group(let groupId, let groupName):
+            conversation = .group(groupId: groupId, groupName: groupName)
+        }
+        messages.append(ChatMessage(from: message.from, text: message.text, conversation: conversation))
     }
 }
 

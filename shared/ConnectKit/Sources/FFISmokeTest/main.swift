@@ -1,9 +1,15 @@
 // Standalone smoke test for the MessagingCore FFI layer: connects to a
-// locally running messaging-server, sends one message, and prints
-// everything the Rust core reports back. Not a UI test -- exercises the
-// Rust<->Swift boundary (and, now, the E2EE layer) directly. Run two
-// instances with different display names to verify real encrypted
-// peer-to-peer delivery, not just a loopback.
+// locally running messaging-server and prints everything the Rust core
+// reports back (fingerprint, TOFU notices, join/leave). Not a UI test --
+// exercises the Rust<->Swift boundary directly. Run two instances with
+// different display names to verify they discover each other.
+//
+// Doesn't exercise sending a 1:1/group message: that needs a live peer_id,
+// and there's no query API yet for "who's currently online" over this
+// listener interface (ConnectClientListener only reports ChatMessage/
+// ConnectionState) -- that's part of the deferred chat-list GUI work, not
+// this smoke test. `core/src/client.rs`'s own test suite covers DM/group
+// send+receive directly instead.
 //
 // Identity is persisted per dataDirTag (defaults to displayName), under
 // a temp directory -- re-running with the same tag reuses the same
@@ -32,7 +38,7 @@ final class TestListener: ConnectClientListener {
     }
 
     func onMessage(message: ChatMessage) {
-        print("[message] from=\"\(message.from)\" text=\"\(message.text)\" isSystem=\(message.isSystem)")
+        print("[message] from=\"\(message.from)\" text=\"\(message.text)\" conversation=\(message.conversation)")
     }
 }
 
@@ -58,12 +64,8 @@ if listener.connectedSemaphore.wait(timeout: .now() + 5) == .timedOut {
     exit(1)
 }
 
-// Give any other already-connected peer a moment to key-exchange with us
-// before we send, and stay alive afterwards so we can receive from others too.
-Thread.sleep(forTimeInterval: 1.5)
-print("Sending test message...")
-client.send(text: "Hello from \(displayName)")
-
+// Stay alive so any other instance connecting concurrently shows up as a
+// PeerJoined/TOFU notice above.
 Thread.sleep(forTimeInterval: 4.0)
 client.disconnect()
 print("done")

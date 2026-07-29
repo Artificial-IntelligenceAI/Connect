@@ -11,8 +11,15 @@ import uniffi.messaging_core.ChatMessage as CoreChatMessage
 import uniffi.messaging_core.ConnectClient
 import uniffi.messaging_core.ConnectClientListener
 import uniffi.messaging_core.ConnectionState as CoreConnectionState
+import uniffi.messaging_core.Conversation as CoreConversation
 
-data class ChatMessage(val id: Long, val from: String, val text: String, val isSystem: Boolean)
+sealed class Conversation {
+    object System : Conversation()
+    data class Direct(val peerIdentityKey: String) : Conversation()
+    data class Group(val groupId: String, val groupName: String) : Conversation()
+}
+
+data class ChatMessage(val id: Long, val from: String, val text: String, val conversation: Conversation)
 
 sealed class ConnectionState {
     object Disconnected : ConnectionState()
@@ -46,8 +53,19 @@ class NetworkClient(context: Context) {
         client.connect(host, port.toUShort(), displayName, Listener())
     }
 
-    fun send(text: String) {
-        client.send(text)
+    fun sendDirectMessage(peerId: String, text: String) {
+        client.sendDirectMessage(peerId, text)
+    }
+
+    /** Creates a group with [memberPeerIds] (currently-online peers only)
+     * and invites each of them. Returns the new group's id, or `null` if
+     * not connected or none of the member ids resolved to a known peer. */
+    fun createGroup(name: String, memberPeerIds: List<String>): String? {
+        return client.createGroup(name, memberPeerIds)
+    }
+
+    fun sendGroupMessage(groupId: String, text: String) {
+        client.sendGroupMessage(groupId, text)
     }
 
     fun disconnect() {
@@ -70,8 +88,13 @@ class NetworkClient(context: Context) {
 
         override fun onMessage(message: CoreChatMessage) {
             mainHandler.post {
+                val conversation = when (val c = message.conversation) {
+                    is CoreConversation.System -> Conversation.System
+                    is CoreConversation.Direct -> Conversation.Direct(c.peerIdentityKey)
+                    is CoreConversation.Group -> Conversation.Group(c.groupId, c.groupName)
+                }
                 messages.add(
-                    ChatMessage(nextMessageId++, message.from, message.text, message.isSystem)
+                    ChatMessage(nextMessageId++, message.from, message.text, conversation)
                 )
             }
         }

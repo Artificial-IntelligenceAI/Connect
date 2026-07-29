@@ -25,15 +25,23 @@ struct AppState {
 }
 
 impl AppState {
-    /// Send to every connected peer except `except`. The server relays
-    /// ciphertext only -- it never has the keys to read `Message`/
-    /// `KeyExchange` content, only who's in the room.
+    /// Send to every connected peer except `except` -- used for peer
+    /// discovery (`PeerJoined`/`PeerLeft`), not chat content.
     fn broadcast_except(&self, except: &PeerId, event: ServerEvent) {
         let peers = self.peers.lock().unwrap();
         for (id, peer) in peers.iter() {
             if id != except {
                 let _ = peer.sender.send(event.clone());
             }
+        }
+    }
+
+    /// Relay to exactly one named peer, if they're still connected. Used
+    /// for `DirectMessage`/`GroupInvite`/`GroupMessage` -- the server
+    /// never has the keys to read any of it, only who it's addressed to.
+    fn send_to(&self, to: &PeerId, event: ServerEvent) {
+        if let Some(peer) = self.peers.lock().unwrap().get(to) {
+            let _ = peer.sender.send(event);
         }
     }
 }
@@ -115,23 +123,23 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
                     state2.broadcast_except(&peer_id2, ServerEvent::PeerJoined { peer: info });
                 }
-                ClientEvent::Message { ciphertext } => {
-                    state2.broadcast_except(
-                        &peer_id2,
-                        ServerEvent::Message {
-                            from: peer_id2.clone(),
-                            ciphertext,
-                        },
+                ClientEvent::DirectMessage { to, ciphertext } => {
+                    state2.send_to(
+                        &to,
+                        ServerEvent::DirectMessage { from: peer_id2.clone(), ciphertext },
                     );
                 }
-                ClientEvent::KeyExchange { to, ciphertext } => {
-                    let target = state2.peers.lock().unwrap().get(&to).map(|p| p.sender.clone());
-                    if let Some(target) = target {
-                        let _ = target.send(ServerEvent::KeyExchange {
-                            from: peer_id2.clone(),
-                            ciphertext,
-                        });
-                    }
+                ClientEvent::GroupInvite { to, group_id, ciphertext } => {
+                    state2.send_to(
+                        &to,
+                        ServerEvent::GroupInvite { from: peer_id2.clone(), group_id, ciphertext },
+                    );
+                }
+                ClientEvent::GroupMessage { to, group_id, ciphertext } => {
+                    state2.send_to(
+                        &to,
+                        ServerEvent::GroupMessage { from: peer_id2.clone(), group_id, ciphertext },
+                    );
                 }
             }
         }
@@ -281,28 +289,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn messages_broadcast_to_others_but_not_echoed_back_to_the_sender() {
-        let port = spawn_test_server().await;
-        let mut alice = connect(port).await;
-        send(&mut alice, join("Alice")).await;
-        recv(&mut alice).await; // roster
-
-        let mut bob = connect(port).await;
-        send(&mut bob, join("Bob")).await;
-        recv(&mut bob).await; // roster
-        recv(&mut alice).await; // PeerJoined(bob)
-
-        send(&mut alice, ClientEvent::Message { ciphertext: "cipher-abc".into() }).await;
-
-        match recv(&mut bob).await {
-            ServerEvent::Message { ciphertext, .. } => assert_eq!(ciphertext, "cipher-abc"),
-            other => panic!("expected Message, got {other:?}"),
-        }
-        assert_silent(&mut alice, Duration::from_millis(300)).await;
-    }
-
-    #[tokio::test]
-    async fn key_exchange_is_delivered_only_to_its_named_target() {
+    async fn direct_message_is_delivered_only_to_its_target() {
         let port = spawn_test_server().await;
 
         let mut alice = connect(port).await;
@@ -317,19 +304,73 @@ mod tests {
         };
         recv(&mut alice).await; // PeerJoined(bob)
 
-        let mut carol = connect(port).await;
+        let mut carol = connect(port).await; // bystander, not addressed
         send(&mut carol, join("Carol")).await;
         recv(&mut carol).await; // roster with alice+bob
         recv(&mut alice).await; // PeerJoined(carol)
         recv(&mut bob).await; // PeerJoined(carol)
 
-        send(&mut bob, ClientEvent::KeyExchange { to: alice_id, ciphertext: "kex-xyz".into() }).await;
+        send(&mut bob, ClientEvent::DirectMessage { to: alice_id, ciphertext: "dm-xyz".into() }).await;
 
         match recv(&mut alice).await {
-            ServerEvent::KeyExchange { ciphertext, .. } => assert_eq!(ciphertext, "kex-xyz"),
-            other => panic!("expected KeyExchange, got {other:?}"),
+            ServerEvent::DirectMessage { ciphertext, .. } => assert_eq!(ciphertext, "dm-xyz"),
+            other => panic!("expected DirectMessage, got {other:?}"),
         }
         assert_silent(&mut carol, Duration::from_millis(300)).await;
+        assert_silent(&mut bob, Duration::from_millis(300)).await; // no echo to the sender
+    }
+
+    #[tokio::test]
+    async fn group_invite_and_messages_reach_only_the_intended_recipient() {
+        let port = spawn_test_server().await;
+
+        let mut alice = connect(port).await;
+        send(&mut alice, join("Alice")).await;
+        recv(&mut alice).await; // roster
+
+        let mut bob = connect(port).await;
+        send(&mut bob, join("Bob")).await;
+        let alice_id = match recv(&mut bob).await {
+            ServerEvent::Roster { peers } => peers[0].peer_id.clone(),
+            other => panic!("expected Roster, got {other:?}"),
+        };
+        recv(&mut alice).await; // PeerJoined(bob)
+
+        let mut carol = connect(port).await; // never invited to the group
+        send(&mut carol, join("Carol")).await;
+        recv(&mut carol).await; // roster with alice+bob
+        recv(&mut alice).await; // PeerJoined(carol)
+        recv(&mut bob).await; // PeerJoined(carol)
+
+        let group_id = "group-1".to_string();
+        send(
+            &mut bob,
+            ClientEvent::GroupInvite { to: alice_id.clone(), group_id: group_id.clone(), ciphertext: "invite-xyz".into() },
+        )
+        .await;
+        match recv(&mut alice).await {
+            ServerEvent::GroupInvite { group_id: received_id, ciphertext, .. } => {
+                assert_eq!(received_id, group_id);
+                assert_eq!(ciphertext, "invite-xyz");
+            }
+            other => panic!("expected GroupInvite, got {other:?}"),
+        }
+        assert_silent(&mut carol, Duration::from_millis(300)).await;
+
+        send(
+            &mut bob,
+            ClientEvent::GroupMessage { to: alice_id, group_id: group_id.clone(), ciphertext: "group-msg-xyz".into() },
+        )
+        .await;
+        match recv(&mut alice).await {
+            ServerEvent::GroupMessage { group_id: received_id, ciphertext, .. } => {
+                assert_eq!(received_id, group_id);
+                assert_eq!(ciphertext, "group-msg-xyz");
+            }
+            other => panic!("expected GroupMessage, got {other:?}"),
+        }
+        assert_silent(&mut carol, Duration::from_millis(300)).await;
+        assert_silent(&mut bob, Duration::from_millis(300)).await; // no echo to the sender
     }
 
     #[tokio::test]
