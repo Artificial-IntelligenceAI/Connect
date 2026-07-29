@@ -4,19 +4,31 @@ A messaging app. Cross-platform and end-to-end encrypted.
 
 ## Architecture
 
-- **Shared core (Rust, `core/`):** the actual networking client — connects
-  over WebSocket, speaks the join/message/system_notice JSON protocol, and
-  reports events back to native UIs through a
-  [UniFFI](https://mozilla.github.io/uniffi-rs/) callback interface
-  (`ConnectClient` / `ConnectClientListener`). Every platform's UI calls
-  into this same Rust implementation instead of reimplementing the
-  protocol — see [shared/README.md](shared/README.md) for how the Swift
-  bindings get generated. E2EE (via
-  [`vodozemac`](https://github.com/matrix-org/vodozemac), Olm/Megolm) is
-  not implemented yet.
-- **Server (Rust, Axum, `server/`):** relays messages between connected
-  clients. Runs in LAN mode today (plain WebSocket, no discovery/TLS yet);
-  a hosted "real server" mode is planned, using the same protocol.
+- **Shared core (Rust, `core/`):** the actual networking + encryption
+  client — connects over WebSocket and reports events back to native UIs
+  through a [UniFFI](https://mozilla.github.io/uniffi-rs/) callback
+  interface (`ConnectClient` / `ConnectClientListener`). Every platform's
+  UI calls into this same Rust implementation instead of reimplementing
+  the protocol — see [shared/README.md](shared/README.md) for how the
+  Swift/Kotlin bindings get generated.
+- **End-to-end encryption is implemented**, via
+  [`vodozemac`](https://github.com/matrix-org/vodozemac) — the same
+  Olm (pairwise)/Megolm (group) design Matrix uses. Each client generates
+  an Olm identity per connection, uses it to privately hand every other
+  peer in the room its Megolm session key, then encrypts actual chat
+  messages with Megolm once per send rather than once per recipient. The
+  server only ever relays ciphertext for message/key-exchange traffic —
+  see `core/src/client.rs` for the full design and its documented v1
+  limitations (keys aren't persisted across restarts, one-time keys are
+  reused across peers, and a message can arrive before its key exchange
+  completes and be silently dropped rather than retried).
+- **Server (Rust, Axum, `server/`):** routes ciphertext between connected
+  clients — broadcasts chat messages and peer-joined/left events to the
+  room, and delivers key-exchange messages point-to-point to the specific
+  peer they're addressed to. It knows who's in the room and who's talking
+  to whom, but never has the keys to read message content. Runs in LAN
+  mode today (no discovery/TLS yet); a hosted "real server" mode is
+  planned, using the same protocol.
 - **macOS / iOS / iPadOS:** Swift / SwiftUI. The app is named "Connect" on
   every Apple platform. `shared/ConnectKit` is a local Swift Package
   holding the actual UI (`ContentView`, `Theme`) and a thin
@@ -31,9 +43,6 @@ A messaging app. Cross-platform and end-to-end encrypted.
   [shared/README.md](shared/README.md).
 - **Windows:** C# / WinUI 3.
 - **Linux:** GTK4 (`gtk4-rs`).
-
-**Encryption is not yet implemented.** Messages are currently sent in
-plaintext over the LAN relay. Do not use this for anything sensitive yet.
 
 ## Repo layout
 
@@ -126,17 +135,20 @@ emulator does **not** share the host's network stack the way the iOS
 Simulator does — use `10.0.2.2` instead of `127.0.0.1` to reach a relay
 server running on your Mac.
 
-### Testing the Rust<->Swift FFI directly
+### Testing the Rust<->Swift FFI (and E2EE) directly
 
 `shared/ConnectKit`'s `FFISmokeTest` target is a small CLI that calls
 `MessagingCore.ConnectClient` directly (bypassing all UI) — connects,
-sends one message, and prints everything the Rust core reports back.
-Useful for verifying the FFI layer itself, or for testing on iOS via
-`xcrun simctl spawn <udid> <path-to-built-binary>` since it needs no
-Simulator UI interaction at all:
+sends one message, and prints everything the Rust core reports back,
+including any messages it receives from other peers (run two at once
+with different display names to see real encrypted delivery between
+them, not just a local echo). Useful for verifying the FFI/crypto layer
+itself without fighting a GUI, or for testing on iOS via `xcrun simctl
+spawn <udid> <path-to-built-binary>` since it needs no Simulator UI
+interaction at all:
 
 ```bash
-cd shared/ConnectKit && swift run FFISmokeTest
+cd shared/ConnectKit && swift run FFISmokeTest [displayName] [host] [port]
 ```
 
 ## License

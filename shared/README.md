@@ -21,6 +21,82 @@ A local Swift Package (`ConnectKit/`) with three targets:
   `MessagingCore.ConnectClient` directly, no UI involved. See the root
   [README](../README.md#testing-the-rust-swift-ffi-directly).
 
+## End-to-end encryption (`core/src/client.rs`)
+
+Implemented via [`vodozemac`](https://github.com/matrix-org/vodozemac),
+the same Olm/Megolm design Matrix uses. This is entirely internal to
+`ConnectClient` — the FFI surface (`ChatMessage`, `ConnectionState`,
+`ConnectClientListener`) never changed when this was added, and no
+platform's UI code needed a single line changed either. That's the
+payoff of the UniFFI architecture: encryption is a Rust-core concern, not
+a per-platform one.
+
+**Protocol**, per connection:
+
+1. On `connect()`, the client generates a fresh `vodozemac::olm::Account`
+   (Curve25519 identity + Ed25519 signing key) and one Olm one-time key,
+   and creates a Megolm `GroupSession` for messages it's about to send.
+   The identity key and one-time key (both base64) go out in the `Join`
+   message.
+2. The server tracks connected peers and their published keys
+   (`PeerInfo`), and on join sends the new client a `Roster` of everyone
+   already in the room, and broadcasts a `PeerJoined` to everyone else.
+   Both cases funnel into the same `handle_new_peer` path client-side.
+3. For every peer it learns about, a client uses `Account::
+   create_outbound_session` (X3DH-style, consuming that peer's published
+   one-time key) to open a pairwise Olm session to them, encrypts its
+   *own* Megolm session key through it, and sends that as a `KeyExchange`
+   -- addressed to that one peer specifically, not broadcast. The server
+   routes `KeyExchange` point-to-point by peer ID; it's the only
+   non-broadcast message type.
+4. Receiving a `KeyExchange`: if it's the first message from that peer,
+   `Account::create_inbound_session` establishes the inbound Olm session
+   from their PreKey message; otherwise reuse the existing one. Either
+   way, decrypting it yields the sender's Megolm session key, which
+   becomes an `InboundGroupSession` keyed by their peer ID.
+5. Actual chat messages are Megolm-encrypted once (`GroupSession::
+   encrypt`) and broadcast -- every peer with an `InboundGroupSession` for
+   that sender can decrypt the same ciphertext, no per-recipient
+   encryption needed. The server's broadcast explicitly excludes the
+   sender (`broadcast_except` in `server/src/main.rs`), so `send()` also
+   locally echoes the plaintext straight to the listener rather than
+   round-tripping through a self-decrypt.
+
+**A bug worth remembering if this code gets touched again:** the Olm
+session used to *encrypt* a `KeyExchange` to a peer and the one used to
+*decrypt* their `KeyExchange` back are different `Session` objects, even
+though they're "with" the same peer -- collapsing them into one
+`HashMap<PeerId, Session>` means decrypt silently uses the wrong session
+and fails. `CryptoState` keeps them in two separate maps
+(`outbound_olm_sessions` / `inbound_olm_sessions`) specifically because
+of this; it was the actual root cause the first time this was end-to-end
+tested and messages silently weren't arriving.
+
+**Known, deliberate v1 limitations** (see also the doc comment on
+`CryptoState`):
+- Identity keys are generated fresh every connection -- nothing is
+  persisted across app restarts, so there's no cross-session key
+  continuity or verification (no "this contact's key changed" warnings,
+  because there's no stored prior key to compare against).
+- Each client publishes exactly one Olm one-time key and never rotates
+  it. Real X3DH wants one-time keys consumed exactly once; if more than
+  one peer establishes a session with a client before it reconnects, that
+  same key gets reused across them. Not a break of the protocol's core
+  security, but it gives up some of the forward-secrecy/deniability
+  benefit one-time-key freshness is meant to provide.
+- No retry or buffering if a chat message arrives before its sender's
+  `KeyExchange` has been processed -- `decrypt_message` just returns
+  `None` and the message is silently dropped, rather than being queued
+  and retried once the key shows up. In practice this is a narrow race
+  (key exchange happens immediately on learning about a peer, before any
+  message would normally be sent), but it's a real gap, not a
+  theoretical one -- it was directly observed during testing.
+- No group re-keying: this is fine for a single persistent room where
+  membership is just "who's currently connected," but there's no
+  mechanism to rotate the Megolm session (e.g. to exclude a peer who left
+  from decrypting anything sent after they left) -- a peer who
+  disconnects still holds whatever Megolm keys they'd already received.
+
 ## Why the FFI bindings aren't committed
 
 `MessagingCoreFFI.xcframework` and `Sources/MessagingCore` are both
