@@ -42,7 +42,7 @@ import androidx.compose.ui.window.Dialog
 import uniffi.messaging_core.KnownPeer
 
 enum class ChatFilter(val label: String) {
-    ALL("All"), DIRECT("1:1"), GROUP("GC")
+    ALL("All"), DIRECT("DM"), GROUP("GC")
 }
 
 sealed class SelectedConversation {
@@ -257,6 +257,20 @@ private fun FilterSidebar(selected: ChatFilter, onSelect: (ChatFilter) -> Unit) 
             )
             Spacer(Modifier.height(8.dp))
         }
+
+        Spacer(Modifier.weight(1f))
+
+        // Icon only for now -- no settings screen exists yet.
+        Text(
+            "⚙",
+            color = Solarized.base01,
+            style = MaterialTheme.typography.titleLarge,
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable { }
+                .padding(vertical = 10.dp),
+            textAlign = androidx.compose.ui.text.style.TextAlign.Center
+        )
     }
 }
 

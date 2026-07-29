@@ -7,7 +7,7 @@ enum ChatFilter: CaseIterable, Hashable {
     var label: String {
         switch self {
         case .all: return "All"
-        case .direct: return "1:1"
+        case .direct: return "DM"
         case .group: return "GC"
         }
     }
@@ -125,6 +125,13 @@ public struct ContentView: View {
                     .clipShape(RoundedRectangle(cornerRadius: 6))
             }
             Spacer()
+            // Icon only for now -- no settings screen exists yet.
+            Button {
+            } label: {
+                Image(systemName: "gearshape")
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(Solarized.base01)
         }
         .padding(8)
         .frame(width: 72)
