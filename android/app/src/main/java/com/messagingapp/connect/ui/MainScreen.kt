@@ -18,13 +18,21 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Checkbox
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.ExposedDropdownMenuBox
+import androidx.compose.material3.ExposedDropdownMenuDefaults
+import androidx.compose.material3.MenuAnchorType
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
+import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -67,6 +75,12 @@ private data class ConversationEntry(
 fun MainScreen(client: NetworkClient? = null) {
     val context = LocalContext.current
     val client = client ?: remember { NetworkClient(context) }
+    // Eagerly load persisted settings here, before any descendant composable
+    // (including this Column's own `.background` below) reads `Solarized.current` --
+    // otherwise the first frame renders with the default theme and only the
+    // children that happen to trigger AppSettings.getInstance() (e.g. ThemedField)
+    // pick up the persisted value, producing a mismatched partial-theme flash.
+    remember { AppSettings.getInstance(context) }
     var selectedConversation by remember { mutableStateOf<SelectedConversation?>(null) }
 
     Column(
@@ -156,9 +170,10 @@ private fun ChatListScreen(client: NetworkClient, onOpen: (SelectedConversation)
     var filter by remember { mutableStateOf(ChatFilter.ALL) }
     var searchText by remember { mutableStateOf("") }
     var showingCreateGroup by remember { mutableStateOf(false) }
+    var showingSettings by remember { mutableStateOf(false) }
 
     Row(modifier = Modifier.fillMaxSize()) {
-        FilterSidebar(filter, onSelect = { filter = it })
+        FilterSidebar(filter, onSelect = { filter = it }, onSettingsClick = { showingSettings = true })
 
         Column(modifier = Modifier.weight(1f)) {
             if (client.state is ConnectionState.Reconnecting) {
@@ -231,10 +246,14 @@ private fun ChatListScreen(client: NetworkClient, onOpen: (SelectedConversation)
             onCancel = { showingCreateGroup = false }
         )
     }
+
+    if (showingSettings) {
+        SettingsDialog(onDismiss = { showingSettings = false })
+    }
 }
 
 @Composable
-private fun FilterSidebar(selected: ChatFilter, onSelect: (ChatFilter) -> Unit) {
+private fun FilterSidebar(selected: ChatFilter, onSelect: (ChatFilter) -> Unit, onSettingsClick: () -> Unit) {
     Column(
         modifier = Modifier
             .width(72.dp)
@@ -260,14 +279,13 @@ private fun FilterSidebar(selected: ChatFilter, onSelect: (ChatFilter) -> Unit) 
 
         Spacer(Modifier.weight(1f))
 
-        // Icon only for now -- no settings screen exists yet.
         Text(
             "⚙",
             color = Solarized.base01,
             style = MaterialTheme.typography.titleLarge,
             modifier = Modifier
                 .fillMaxWidth()
-                .clickable { }
+                .clickable { onSettingsClick() }
                 .padding(vertical = 10.dp),
             textAlign = androidx.compose.ui.text.style.TextAlign.Center
         )
@@ -483,11 +501,13 @@ private fun ThemedField(
     placeholder: String,
     modifier: Modifier = Modifier.widthIn(min = 280.dp)
 ) {
+    val settings = AppSettings.getInstance(LocalContext.current)
     OutlinedTextField(
         value = value,
         onValueChange = onValueChange,
         placeholder = { Text(placeholder) },
         modifier = modifier,
+        keyboardOptions = KeyboardOptions(autoCorrectEnabled = settings.autoCorrectEnabled),
         colors = OutlinedTextFieldDefaults.colors(
             unfocusedContainerColor = Solarized.base2,
             focusedContainerColor = Solarized.base2,
@@ -497,4 +517,77 @@ private fun ThemedField(
             focusedBorderColor = Solarized.blue
         )
     )
+}
+
+/** Theme (dropdown) and Auto-Correct (toggle) -- the only two settings so
+ * far. Reads/writes the shared [AppSettings] instance so changes apply
+ * live and persist immediately. */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun SettingsDialog(onDismiss: () -> Unit) {
+    val settings = AppSettings.getInstance(LocalContext.current)
+    var themeMenuExpanded by remember { mutableStateOf(false) }
+
+    Dialog(onDismissRequest = onDismiss) {
+        Column(
+            modifier = Modifier
+                .background(Solarized.base3, RoundedCornerShape(8.dp))
+                .padding(20.dp)
+                .widthIn(min = 280.dp)
+        ) {
+            Text("Settings", style = MaterialTheme.typography.titleMedium, color = Solarized.base01)
+            Spacer(Modifier.height(16.dp))
+
+            Text("Theme", color = Solarized.base01, style = MaterialTheme.typography.bodySmall)
+            Spacer(Modifier.height(4.dp))
+            ExposedDropdownMenuBox(
+                expanded = themeMenuExpanded,
+                onExpandedChange = { themeMenuExpanded = it }
+            ) {
+                OutlinedTextField(
+                    value = settings.theme.label,
+                    onValueChange = {},
+                    readOnly = true,
+                    trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = themeMenuExpanded) },
+                    modifier = Modifier.menuAnchor(MenuAnchorType.PrimaryNotEditable).fillMaxWidth(),
+                    colors = OutlinedTextFieldDefaults.colors(
+                        unfocusedContainerColor = Solarized.base2,
+                        focusedContainerColor = Solarized.base2,
+                        unfocusedTextColor = Solarized.base00,
+                        focusedTextColor = Solarized.base00,
+                        unfocusedBorderColor = Solarized.base1,
+                        focusedBorderColor = Solarized.blue
+                    )
+                )
+                ExposedDropdownMenu(
+                    expanded = themeMenuExpanded,
+                    onDismissRequest = { themeMenuExpanded = false }
+                ) {
+                    AppTheme.entries.forEach { option ->
+                        DropdownMenuItem(
+                            text = { Text(option.label) },
+                            onClick = {
+                                settings.selectTheme(option)
+                                themeMenuExpanded = false
+                            }
+                        )
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(16.dp))
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("Auto-Correct", color = Solarized.base01, modifier = Modifier.weight(1f))
+                Switch(
+                    checked = settings.autoCorrectEnabled,
+                    onCheckedChange = { settings.setAutoCorrect(it) },
+                    colors = SwitchDefaults.colors(checkedTrackColor = Solarized.blue)
+                )
+            }
+        }
+    }
 }

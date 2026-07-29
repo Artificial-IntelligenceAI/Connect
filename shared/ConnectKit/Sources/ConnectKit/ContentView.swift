@@ -34,6 +34,7 @@ private struct ConversationEntry: Identifiable {
 
 public struct ContentView: View {
     @StateObject private var client = NetworkClient()
+    @ObservedObject private var settings = AppSettings.shared
 
     @State private var host = "127.0.0.1"
     @State private var port = "7878"
@@ -43,6 +44,7 @@ public struct ContentView: View {
     @State private var searchText = ""
     @State private var selectedConversation: SelectedConversation?
     @State private var showingCreateGroup = false
+    @State private var showingSettings = false
 
     public init() {}
 
@@ -62,6 +64,7 @@ public struct ContentView: View {
         .frame(minWidth: 420, minHeight: 500)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Solarized.base3)
+        .preferredColorScheme(settings.theme == .solarizedDark ? .dark : .light)
     }
 
     private var connectView: some View {
@@ -125,8 +128,8 @@ public struct ContentView: View {
                     .clipShape(RoundedRectangle(cornerRadius: 6))
             }
             Spacer()
-            // Icon only for now -- no settings screen exists yet.
             Button {
+                showingSettings = true
             } label: {
                 Image(systemName: "gearshape")
             }
@@ -136,6 +139,9 @@ public struct ContentView: View {
         .padding(8)
         .frame(width: 72)
         .background(Solarized.base2)
+        .sheet(isPresented: $showingSettings) {
+            SettingsView(settings: settings)
+        }
     }
 
     private var listHeader: some View {
@@ -349,7 +355,42 @@ public struct ContentView: View {
                 RoundedRectangle(cornerRadius: 6)
                     .stroke(Solarized.base1, lineWidth: 1)
             )
+            .autocorrectionDisabled(!settings.autoCorrectEnabled)
             .onSubmit { onSubmit?() }
+    }
+}
+
+/// Theme (dropdown) and Auto-Correct (toggle) -- the only two settings so
+/// far. Reads/writes `AppSettings.shared` directly via the passed-in
+/// observed instance so changes apply live and persist immediately.
+private struct SettingsView: View {
+    @ObservedObject var settings: AppSettings
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            Text("Settings").font(.headline).foregroundStyle(Solarized.base01)
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Theme").foregroundStyle(Solarized.base01)
+                Picker("Theme", selection: $settings.theme) {
+                    ForEach(AppTheme.allCases) { theme in
+                        Text(theme.rawValue).tag(theme)
+                    }
+                }
+                .pickerStyle(.menu)
+                .tint(Solarized.blue)
+                .labelsHidden()
+            }
+
+            Toggle("Auto-Correct", isOn: $settings.autoCorrectEnabled)
+                .tint(Solarized.blue)
+                .foregroundStyle(Solarized.base01)
+
+            Spacer()
+        }
+        .padding(20)
+        .frame(width: 300, height: 220)
+        .background(Solarized.base3)
     }
 }
 
@@ -370,6 +411,7 @@ private struct CreateGroupSheet: View {
 
             TextField("Group name", text: $name)
                 .textFieldStyle(.roundedBorder)
+                .autocorrectionDisabled(!AppSettings.shared.autoCorrectEnabled)
 
             Text("Members (online now)").font(.caption).foregroundStyle(Solarized.base1)
             if onlinePeers.isEmpty {

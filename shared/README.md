@@ -259,6 +259,43 @@ message history (still session-only), last-message preview or
 recency-based sort (no timestamps exist yet), adding members to an
 existing group or inviting offline peers, unread badges.
 
+## Settings: Theme and Auto-Correct (`AppSettings.swift` / `AppSettings.kt`)
+
+The gear icon at the bottom of the sidebar (previously unwired) now opens
+a settings sheet/dialog with two options, backed by a platform-local,
+`UserDefaults`/`SharedPreferences`-persisted singleton -- no core/FFI
+involvement, since neither setting affects wire protocol or crypto
+behavior:
+
+- **Theme**: a dropdown (`Picker`/`ExposedDropdownMenuBox`) between
+  "Solarized Light" and "Solarized Dark". `Solarized`'s color constants
+  (in `Theme.swift`/`Theme.kt`) became live reads of the current theme
+  instead of fixed light-only values, so every existing `Solarized.xxx`
+  call site across both UIs re-themes automatically without change.
+  `ContentView` also reacts by setting `.preferredColorScheme` from the
+  selected theme.
+- **Auto-Correct**: a toggle (`Toggle`/`Switch`) wired to
+  `.autocorrectionDisabled(_:)` on iOS/macOS and `KeyboardOptions(autoCorrectEnabled
+  = ...)` on Android, applied to every text field (connect fields, search,
+  message composer, group-name field).
+
+**A composition-order gotcha on Android**: `AppSettings` was originally
+only instantiated lazily, inside leaf composables like `ThemedField`
+(the first place that happened to read it). That meant the very first
+frame after a cold launch -- before any child composable ran --
+rendered with `Solarized.current`'s hardcoded default (light), while
+`AppSettings`'s `init` block mutated `Solarized.current` to the persisted
+value as a side effect *during* composition once a descendant finally
+called `getInstance`. Mutating Compose state mid-composition like that
+produces inconsistent results across the tree in the same frame (e.g. an
+outer `Column` background that had already been evaluated one way, and
+child fields that picked up the corrected value) rather than a clean,
+whole-tree recomposition. Fixed by eagerly calling
+`remember { AppSettings.getInstance(context) }` at the very top of
+`MainScreen`, before any descendant -- including its own
+`.background(Solarized.base3)` -- is composed, so the persisted theme is
+already active before the first frame renders anything.
+
 ## Identity persistence and verification (`core/src/persistence.rs`)
 
 `ConnectClient::new(dataDir)` takes a platform-supplied, writable,
