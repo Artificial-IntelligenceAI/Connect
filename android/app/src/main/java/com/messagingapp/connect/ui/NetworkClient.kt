@@ -12,6 +12,8 @@ import uniffi.messaging_core.ConnectClient
 import uniffi.messaging_core.ConnectClientListener
 import uniffi.messaging_core.ConnectionState as CoreConnectionState
 import uniffi.messaging_core.Conversation as CoreConversation
+import uniffi.messaging_core.GroupSummary
+import uniffi.messaging_core.KnownPeer
 
 sealed class Conversation {
     object System : Conversation()
@@ -38,6 +40,10 @@ class NetworkClient(context: Context) {
     var state: ConnectionState by mutableStateOf(ConnectionState.Disconnected)
         private set
     val messages = mutableStateListOf<ChatMessage>()
+    var knownPeers: List<KnownPeer> by mutableStateOf(emptyList())
+        private set
+    var groups: List<GroupSummary> by mutableStateOf(emptyList())
+        private set
 
     // Context.filesDir is already app-private/sandboxed by Android, same
     // role as the app support directory on Apple platforms.
@@ -53,8 +59,8 @@ class NetworkClient(context: Context) {
         client.connect(host, port.toUShort(), displayName, Listener())
     }
 
-    fun sendDirectMessage(peerId: String, text: String) {
-        client.sendDirectMessage(peerId, text)
+    fun sendDirectMessage(peerIdentityKey: String, text: String) {
+        client.sendDirectMessage(peerIdentityKey, text)
     }
 
     /** Creates a group with [memberPeerIds] (currently-online peers only)
@@ -96,6 +102,14 @@ class NetworkClient(context: Context) {
                 messages.add(
                     ChatMessage(nextMessageId++, message.from, message.text, conversation)
                 )
+
+                // Any message (a chat message or a system notice like "X
+                // joined" or "Added to group") is a reasonable cue that the
+                // contacts/group lists might have changed -- there's no
+                // finer-grained push signal for this yet, and list sizes
+                // are small enough that refreshing every time is cheap.
+                knownPeers = client.listKnownPeers()
+                groups = client.listGroups()
             }
         }
     }

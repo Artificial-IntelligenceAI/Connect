@@ -90,6 +90,27 @@ pub struct ChatMessage {
     pub conversation: Conversation,
 }
 
+/// A snapshot of one entry in the trust-on-first-use contacts store
+/// (`known_peer_keys`), for populating a 1:1 chat list. `peer_id` is
+/// `Some` if they're reachable on the current connection right now,
+/// `None` if they're only known from a past session.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct KnownPeer {
+    pub identity_key: String,
+    pub display_name: String,
+    pub peer_id: Option<PeerId>,
+}
+
+/// A snapshot of one persisted group chat, for populating a group chat
+/// list. No membership detail beyond a count -- see `create_group`'s doc
+/// comment for why full membership resolution only happens at send time.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct GroupSummary {
+    pub group_id: GroupId,
+    pub name: String,
+    pub member_count: u32,
+}
+
 /// Implemented by the host app (Swift/Kotlin) to receive events from the client.
 /// Methods may be called from a background thread; the implementation is
 /// responsible for hopping to the main thread before touching UI state.
@@ -437,37 +458,38 @@ impl ConnectClient {
         });
     }
 
-    pub fn send_direct_message(&self, peer_id: String, text: String) {
+    /// Send a 1:1 message to `peer_identity_key`, resolving their current
+    /// live `peer_id` at send time (not whenever the caller first learned
+    /// about them) -- same pattern `send_group_message` already uses, so a
+    /// UI holding a chat open across one of their reconnects doesn't need
+    /// to track a separately-refreshed peer_id itself. If they're not
+    /// currently reachable, the network send is skipped, but the message
+    /// still echoes locally -- matches this file's existing fire-and-forget
+    /// philosophy (delivery was never confirmed even before this).
+    pub fn send_direct_message(&self, peer_identity_key: String, text: String) {
         let Some(crypto) = self.crypto.lock().unwrap().clone() else {
             return;
         };
 
-        let ciphertext = {
-            let mut state = crypto.lock().unwrap();
-            let Some(session) = state.outbound_olm_sessions.get_mut(&peer_id) else {
-                return;
+        let peer_id = crypto.lock().unwrap().peer_id_by_identity.get(&peer_identity_key).cloned();
+        if let Some(peer_id) = &peer_id {
+            let ciphertext = {
+                let mut state = crypto.lock().unwrap();
+                state.outbound_olm_sessions.get_mut(peer_id).and_then(|session| {
+                    let olm_message = session.encrypt(text.as_bytes()).ok()?;
+                    serde_json::to_string(&olm_message).ok()
+                })
             };
-            let Ok(olm_message) = session.encrypt(text.as_bytes()) else {
-                return;
-            };
-            let Ok(json) = serde_json::to_string(&olm_message) else {
-                return;
-            };
-            json
-        };
-        if let Some(tx) = self.outgoing.lock().unwrap().as_ref() {
-            let _ = tx.send(ClientEvent::DirectMessage { to: peer_id.clone(), ciphertext });
+            if let Some(ciphertext) = ciphertext {
+                if let Some(tx) = self.outgoing.lock().unwrap().as_ref() {
+                    let _ = tx.send(ClientEvent::DirectMessage { to: peer_id.clone(), ciphertext });
+                }
+            }
         }
 
         // The server never echoes anything back to its sender, so echo
         // locally instead of round-tripping through a self-decrypt.
-        let (from, peer_identity_key) = {
-            let state = crypto.lock().unwrap();
-            (state.display_name.clone(), state.peer_identity_keys.get(&peer_id).map(|k| k.to_base64()))
-        };
-        let Some(peer_identity_key) = peer_identity_key else {
-            return;
-        };
+        let from = crypto.lock().unwrap().display_name.clone();
         if let Some(listener) = self.listener.lock().unwrap().as_ref() {
             listener.on_message(ChatMessage {
                 from,
@@ -571,6 +593,45 @@ impl ConnectClient {
                 conversation: Conversation::Group { group_id, group_name },
             });
         }
+    }
+
+    /// Every peer this client has ever discovered (persisted TOFU contacts,
+    /// `known_peers.json`), for populating a 1:1 chat list. Empty if not
+    /// currently connected -- the contacts themselves are only loaded into
+    /// memory once `connect()` has run.
+    pub fn list_known_peers(&self) -> Vec<KnownPeer> {
+        let Some(crypto) = self.crypto.lock().unwrap().clone() else {
+            return Vec::new();
+        };
+        let state = crypto.lock().unwrap();
+        state
+            .known_peer_keys
+            .iter()
+            .map(|(display_name, identity_key)| KnownPeer {
+                identity_key: identity_key.clone(),
+                display_name: display_name.clone(),
+                peer_id: state.peer_id_by_identity.get(identity_key).cloned(),
+            })
+            .collect()
+    }
+
+    /// Every group chat this client is a member of (persisted `groups.json`,
+    /// created locally or learned via a `GroupInvite`), for populating a
+    /// group chat list. Empty if not currently connected.
+    pub fn list_groups(&self) -> Vec<GroupSummary> {
+        let Some(crypto) = self.crypto.lock().unwrap().clone() else {
+            return Vec::new();
+        };
+        let state = crypto.lock().unwrap();
+        state
+            .groups
+            .iter()
+            .map(|(group_id, group)| GroupSummary {
+                group_id: group_id.clone(),
+                name: group.name.clone(),
+                member_count: group.members.len() as u32,
+            })
+            .collect()
     }
 
     pub fn disconnect(&self) {
@@ -1032,6 +1093,99 @@ mod tests {
         // no ciphertext for her to receive. Confirm the group stayed
         // unknown to her.
         assert!(!carol.lock().unwrap().groups.contains_key(&group_id));
+    }
+
+    // -- Chat-list query methods -------------------------------------------
+    //
+    // These construct a `ConnectClient` directly and reach into its private
+    // `crypto`/`outgoing`/`listener` fields (legal: this test module is a
+    // descendant of `client`) to seed state without needing a real
+    // connection, the same shortcut `new_crypto`/`announce` above use.
+
+    #[test]
+    fn list_known_peers_and_groups_are_empty_when_not_connected() {
+        let client = ConnectClient::new(temp_data_dir());
+        assert!(client.list_known_peers().is_empty());
+        assert!(client.list_groups().is_empty());
+    }
+
+    #[test]
+    fn list_known_peers_reports_online_and_offline_status() {
+        let client = ConnectClient::new(temp_data_dir());
+        let crypto = new_crypto("Alice");
+        {
+            let mut state = crypto.lock().unwrap();
+            state.known_peer_keys.insert("Bob".into(), "bob-identity-key".into());
+            state.known_peer_keys.insert("Carol".into(), "carol-identity-key".into());
+            // Bob is currently reachable; Carol is only known from the past
+            // (no matching peer_id_by_identity entry).
+            state.peer_id_by_identity.insert("bob-identity-key".into(), "bob-peer".into());
+        }
+        *client.crypto.lock().unwrap() = Some(crypto);
+
+        let mut peers = client.list_known_peers();
+        peers.sort_by(|a, b| a.display_name.cmp(&b.display_name));
+
+        assert_eq!(peers.len(), 2);
+        assert_eq!(peers[0].display_name, "Bob");
+        assert_eq!(peers[0].peer_id.as_deref(), Some("bob-peer"));
+        assert_eq!(peers[1].display_name, "Carol");
+        assert_eq!(peers[1].peer_id, None);
+    }
+
+    #[test]
+    fn list_groups_reports_names_and_member_counts() {
+        let client = ConnectClient::new(temp_data_dir());
+        let crypto = new_crypto("Alice");
+        {
+            let mut state = crypto.lock().unwrap();
+            state.groups.insert(
+                "group-1".to_string(),
+                persistence::GroupMetadata {
+                    name: "Family".to_string(),
+                    members: vec![
+                        persistence::GroupMember { identity_key: "a".into(), display_name: "Alice".into() },
+                        persistence::GroupMember { identity_key: "b".into(), display_name: "Bob".into() },
+                    ],
+                },
+            );
+        }
+        *client.crypto.lock().unwrap() = Some(crypto);
+
+        let groups = client.list_groups();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].name, "Family");
+        assert_eq!(groups[0].member_count, 2);
+    }
+
+    /// Regression guard for the `send_direct_message` signature change:
+    /// resolving the target's live peer_id now happens at send time, and
+    /// an unresolvable (offline) target must not silently drop the local
+    /// echo the way an early `return` before the echo block used to.
+    #[test]
+    fn send_direct_message_echoes_locally_even_when_the_target_is_offline() {
+        let client = ConnectClient::new(temp_data_dir());
+        *client.crypto.lock().unwrap() = Some(new_crypto("Alice"));
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<ClientEvent>();
+        *client.outgoing.lock().unwrap() = Some(tx);
+        let listener = std::sync::Arc::new(TestListener::default());
+        let dyn_listener: std::sync::Arc<dyn ConnectClientListener> = listener.clone();
+        *client.listener.lock().unwrap() = Some(dyn_listener);
+
+        client.send_direct_message("offline-bob-identity".to_string(), "hi".to_string());
+
+        assert!(
+            rx.try_recv().is_err(),
+            "no network send should happen for a peer with no resolvable peer_id"
+        );
+        let messages = listener.messages.lock().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].text, "hi");
+        assert!(matches!(
+            &messages[0].conversation,
+            Conversation::Direct { peer_identity_key } if peer_identity_key == "offline-bob-identity"
+        ));
     }
 
     // -- WebSocket state machine (connect()'s retry/backoff loop) --------

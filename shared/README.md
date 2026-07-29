@@ -23,8 +23,8 @@ A local Swift Package (`ConnectKit/`) with three targets:
 
 ## Automated tests
 
-`cargo test --workspace` runs everything below (26 tests as of this
-writing: 20 in `messaging-core`, 6 in `messaging-server`). Two different
+`cargo test --workspace` runs everything below (30 tests as of this
+writing: 24 in `messaging-core`, 6 in `messaging-server`). Two different
 styles are used deliberately, at different layers:
 
 ### `core/src` -- fast, no sockets
@@ -47,7 +47,10 @@ a socket in between. These run in milliseconds.
   implementation would have broken, now generalized to groups); all three
   TOFU outcomes (new contact, unchanged key on reconnect, changed key
   warning); `backoff_delay`'s growth/cap; `sleep_or_cancel`'s two exit
-  paths; `reset_peer_state` clearing peer maps but not identity.
+  paths; `reset_peer_state` clearing peer maps but not identity;
+  `list_known_peers`/`list_groups` reporting correct online/offline
+  status and member counts; `send_direct_message` still echoing locally
+  even when its target isn't currently reachable.
 - **`persistence.rs`**: identity persists across repeated
   `load_or_create_account` calls against the same `data_dir` and differs
   across different dirs; `known_peers.json`/`groups.json` round-trip;
@@ -147,11 +150,20 @@ Olm sessions, not a shared group key:
    published one-time key). Peer discovery and conversation-starting are
    now fully decoupled -- nothing is sent just because you learned about
    someone.
-3. **1:1 messages** (`send_direct_message`): Olm-encrypt the text on the
-   prepared `outbound_olm_sessions[peer_id]` session and send it as a
-   `DirectMessage`, addressed to that one peer. Repeated sends keep
-   advancing the same ratchet -- this is ordinary continuous Olm usage,
-   not a one-shot handshake.
+3. **1:1 messages** (`send_direct_message(peer_identity_key, text)`):
+   resolves the peer's *current* live `peer_id` from their stable identity
+   via `peer_id_by_identity` at send time (not whenever the caller first
+   looked them up), Olm-encrypts the text on the prepared
+   `outbound_olm_sessions[peer_id]` session, and sends it as a
+   `DirectMessage`. Taking a stable identity instead of a `peer_id`
+   directly matters once a UI holds a chat open across one of that peer's
+   reconnects -- `send_group_message` already worked this way, this just
+   brings `send_direct_message` in line with it. If the identity doesn't
+   currently resolve (they're offline), the network send is skipped but
+   the message still echoes locally -- matches this file's existing
+   fire-and-forget philosophy, delivery was never confirmed either way.
+   Repeated sends keep advancing the same ratchet -- this is ordinary
+   continuous Olm usage, not a one-shot handshake.
 4. **Group chats**: `create_group(name, member_peer_ids)` persists the
    group (`groups.json`) and, for each member, Olm-encrypts
    `{name, members}` and sends it as a `GroupInvite`. A member who
@@ -198,6 +210,54 @@ alike.
   from scratch next time either side sends something, and anything sent
   in that exact window can be silently dropped. Same accepted class of
   race as the one below, just extended to cover DMs/groups too.
+
+## Chat-list GUI (`ContentView.swift` / `MainScreen.kt`)
+
+The single connect-then-chat screen is now a connect screen -> chat list
+-> per-conversation view flow, on both platforms, backed by two new
+read-only query methods on `ConnectClient`:
+
+```rust
+pub fn list_known_peers(&self) -> Vec<KnownPeer>;  // {identity_key, display_name, peer_id: Option<PeerId>}
+pub fn list_groups(&self) -> Vec<GroupSummary>;    // {group_id, name, member_count}
+```
+Both just snapshot existing `CryptoState` fields under its lock (no new
+persistence): `list_known_peers` iterates `known_peer_keys` (the TOFU
+contacts store -- so the "1:1" list is "everyone you've ever shared a
+room with," not specifically "everyone you've DMed," since there's no
+separate DM-history tracking yet) and cross-references
+`peer_id_by_identity` for online/offline status; `list_groups` iterates
+`groups` (already persisted via `groups.json`).
+
+**Chat list screen**: a narrow left sidebar with three filter buttons
+(All/1:1/GC, a UI-only `ChatFilter` concept -- not to be confused with
+core's `Conversation` enum used for message tagging), a search field
+filtering the selected category by case-insensitive substring match on
+name (purely client-side, no core involvement), the filtered/searched
+list itself, a small feed for room-wide system notices (fingerprint,
+join/leave, TOFU warnings -- these aren't tied to any one conversation
+anymore, so they live here instead of inside a per-conversation view),
+and a "+" affordance for a minimal group-creation flow (name + checklist
+of currently-*online* known peers, calling `createGroup`).
+
+**Refresh strategy**: both platforms' `NetworkClient` wrapper re-calls
+`listKnownPeers()`/`listGroups()` at the end of every `onMessage`
+callback -- any chat message or system notice is a reasonable cue that
+the roster/group list might have changed, and list sizes are small
+enough that refreshing every time is cheap. Not a precise push signal,
+just a good-enough polling hook.
+
+**Per-conversation view**: opened by tapping a list entry; filters
+`client.messages` to just the ones whose `conversation` matches the open
+target, reuses the existing message-row rendering, and re-enables the
+composer (disabled since the previous pass, which had no UI for picking
+a send target) wired to `sendDirectMessage`/`sendGroupMessage`
+accordingly.
+
+**Explicitly out of scope for this pass**: persisted per-conversation
+message history (still session-only), last-message preview or
+recency-based sort (no timestamps exist yet), adding members to an
+existing group or inviting offline peers, unread badges.
 
 ## Identity persistence and verification (`core/src/persistence.rs`)
 

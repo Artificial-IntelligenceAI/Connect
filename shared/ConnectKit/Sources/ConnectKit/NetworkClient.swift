@@ -37,6 +37,8 @@ private func defaultDataDirectory() -> String {
 final class NetworkClient: ObservableObject {
     @Published var messages: [ChatMessage] = []
     @Published var state: ConnectionState = .disconnected
+    @Published var knownPeers: [KnownPeer] = []
+    @Published var groups: [GroupSummary] = []
 
     private let client = MessagingCore.ConnectClient(dataDir: defaultDataDirectory())
     private var listener: Listener?
@@ -51,8 +53,8 @@ final class NetworkClient: ObservableObject {
         client.connect(host: host, port: portNumber, displayName: displayName, listener: listener)
     }
 
-    func sendDirectMessage(peerId: String, text: String) {
-        client.sendDirectMessage(peerId: peerId, text: text)
+    func sendDirectMessage(peerIdentityKey: String, text: String) {
+        client.sendDirectMessage(peerIdentityKey: peerIdentityKey, text: text)
     }
 
     /// Creates a group with `memberPeerIds` (currently-online peers only)
@@ -98,6 +100,14 @@ final class NetworkClient: ObservableObject {
             conversation = .group(groupId: groupId, groupName: groupName)
         }
         messages.append(ChatMessage(from: message.from, text: message.text, conversation: conversation))
+
+        // Any message (a chat message or a system notice like "X joined"
+        // or "Added to group") is a reasonable cue that the contacts/group
+        // lists might have changed -- there's no finer-grained push signal
+        // for this yet, and list sizes are small enough that refreshing
+        // every time is cheap.
+        knownPeers = client.listKnownPeers()
+        groups = client.listGroups()
     }
 }
 

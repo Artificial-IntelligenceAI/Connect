@@ -105,17 +105,12 @@ cargo run -p messaging-server
 cd macos && swift run
 ```
 
-Connect using `127.0.0.1` / port `7878` and a display name.
-
-**The message composer is currently disabled on all three platforms.**
-Sending now requires targeting a specific peer or group
-(`sendDirectMessage`/`createGroup`/`sendGroupMessage`), and the existing
-single connect-then-chat screen has no UI for picking one — that's the
-chat-list GUI planned next. Until then, the connect flow, roster/TOFU
-system notices, and reconnection banner all still work and are worth
-trying; sending a message from the UI is not. See [shared/ConnectKit's
-test suite](shared/README.md#automated-tests) or `core/src/client.rs`'s
-own tests to see DMs/groups actually exercised today.
+Connect using `127.0.0.1` / port `7878` and a display name, then pick a
+conversation from the chat list (a left sidebar filters it to All/1:1/GC,
+with a search bar above the list) or use the "+" button to start a new
+group chat with whoever's currently online. See [shared/README.md](shared/README.md#chat-list-gui-contentviewswift--mainscreenkt)
+for the chat-list GUI's design, or `core/src/client.rs`'s own test suite
+to see DMs/groups exercised directly without a GUI.
 
 ### Prebuilt macOS app bundle
 
