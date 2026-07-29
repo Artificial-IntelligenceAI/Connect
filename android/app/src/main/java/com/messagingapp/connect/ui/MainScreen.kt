@@ -46,7 +46,7 @@ fun MainScreen(client: NetworkClient? = null) {
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
         when (client.state) {
-            ConnectionState.Connected -> ChatScreen(client)
+            ConnectionState.Connected, is ConnectionState.Reconnecting -> ChatScreen(client)
             else -> ConnectScreen(client)
         }
     }
@@ -116,6 +116,18 @@ private fun ChatScreen(client: NetworkClient) {
     }
 
     Column(modifier = Modifier.fillMaxSize()) {
+        val reconnecting = client.state as? ConnectionState.Reconnecting
+        if (reconnecting != null) {
+            Text(
+                "Reconnecting… (attempt ${reconnecting.attempt})",
+                color = Solarized.yellow,
+                style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(Solarized.base2)
+                    .padding(6.dp)
+            )
+        }
         LazyColumn(
             state = listState,
             modifier = Modifier

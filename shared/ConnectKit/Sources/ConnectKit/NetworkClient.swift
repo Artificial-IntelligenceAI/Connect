@@ -12,6 +12,7 @@ enum ConnectionState: Equatable {
     case disconnected
     case connecting
     case connected
+    case reconnecting(attempt: UInt32)
     case failed(String)
 }
 
@@ -62,6 +63,8 @@ final class NetworkClient: ObservableObject {
             state = .connecting
         case .connected:
             state = .connected
+        case .reconnecting(let attempt):
+            state = .reconnecting(attempt: attempt)
         case .failed(let reason):
             state = .failed(reason)
         }

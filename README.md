@@ -36,6 +36,17 @@ A messaging app. Cross-platform and end-to-end encrypted.
   "End-to-end encryption" in [shared/README.md](shared/README.md) for the
   full design and known limitations (TOFU is anchored to display name,
   which anyone can type, not a stronger identity).
+- **Dropped connections retry automatically with backoff.** A server
+  restart, wifi hiccup, or laptop sleep/wake no longer leaves the app
+  stuck showing "Connected" over a dead socket: the client reports a new
+  `Reconnecting` state and retries (1s, 2s, 4s, ... capped at 30s) until
+  it succeeds, re-establishing encrypted sessions with whoever's still in
+  the room. A user-initiated disconnect is distinct from a drop and does
+  not retry. Messages sent while reconnecting are queued and delivered
+  once the connection comes back, not lost. See "Reconnection handling"
+  in [shared/README.md](shared/README.md) for the full design, including
+  a real bug caught during testing (a drop with no message in flight went
+  undetected until the read side was watched too, not just writes).
 - **Server (Rust, Axum, `server/`):** routes ciphertext between connected
   clients — broadcasts chat messages and peer-joined/left events to the
   room, and delivers key-exchange messages point-to-point to the specific

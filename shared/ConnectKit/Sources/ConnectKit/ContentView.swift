@@ -13,7 +13,7 @@ public struct ContentView: View {
     public var body: some View {
         Group {
             switch client.state {
-            case .connected:
+            case .connected, .reconnecting:
                 chatView
             default:
                 connectView
@@ -52,6 +52,14 @@ public struct ContentView: View {
 
     private var chatView: some View {
         VStack(spacing: 0) {
+            if case .reconnecting(let attempt) = client.state {
+                Text("Reconnecting\u{2026} (attempt \(attempt))")
+                    .font(.caption)
+                    .foregroundStyle(Solarized.yellow)
+                    .frame(maxWidth: .infinity)
+                    .padding(6)
+                    .background(Solarized.base2)
+            }
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 8) {

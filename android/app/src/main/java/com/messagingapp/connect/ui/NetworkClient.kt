@@ -18,6 +18,7 @@ sealed class ConnectionState {
     object Disconnected : ConnectionState()
     object Connecting : ConnectionState()
     object Connected : ConnectionState()
+    data class Reconnecting(val attempt: UInt) : ConnectionState()
     data class Failed(val reason: String) : ConnectionState()
 }
 
@@ -61,6 +62,7 @@ class NetworkClient(context: Context) {
                     is CoreConnectionState.Disconnected -> ConnectionState.Disconnected
                     is CoreConnectionState.Connecting -> ConnectionState.Connecting
                     is CoreConnectionState.Connected -> ConnectionState.Connected
+                    is CoreConnectionState.Reconnecting -> ConnectionState.Reconnecting(state.attempt)
                     is CoreConnectionState.Failed -> ConnectionState.Failed(state.reason)
                 }
             }

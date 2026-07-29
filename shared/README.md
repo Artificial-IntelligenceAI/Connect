@@ -145,6 +145,73 @@ correctly triggers the key-changed warning on the second connection.
   from decrypting anything sent after they left) -- a peer who
   disconnects still holds whatever Megolm keys they'd already received.
 
+## Reconnection handling (`core/src/client.rs`)
+
+Before this, a dropped connection (server restart, wifi hiccup, laptop
+sleep/wake) left the client silently stuck: no error, no retry, the UI
+just showed "Connected" forever over a dead socket. `connect()` is now a
+retry loop, not a one-shot attempt:
+
+- The very first connection attempt behaves as before -- a failure (can't
+  reach the host, or the initial `Join` send fails) reports
+  `ConnectionState::Failed { reason }` immediately, no retry. That's a
+  configuration problem (wrong address/port), not a transient drop, and
+  retrying blindly would just hide a typo behind a spinner.
+- Once a connection has succeeded at least once, a later drop reports
+  `ConnectionState::Reconnecting { attempt }` and retries with exponential
+  backoff (`backoff_delay`: 1s, 2s, 4s, 8s, 16s, capped at 30s), resetting
+  to `attempt = 1` again after the next successful connect.
+- `disconnect()` now actually stops the background task (previously it
+  only cleared the client's own references -- the spawned connection loop
+  had no way to know and would run forever in the background, including
+  calling back into a listener the UI had already abandoned). A
+  `tokio::sync::watch::channel<bool>` cancellation signal, stored on
+  `ConnectClient` and checked between retries and inside the write loop's
+  `tokio::select!`, makes a user-initiated disconnect actually distinct
+  from an unexpected drop: cancellation stops the loop for good, a drop
+  retries.
+- **Both halves of the socket are watched, not just writes.** The
+  straightforward version of this only detects a drop when
+  `write.send(...)` fails -- but if nothing happens to be queued for
+  sending when the peer disappears (the common case: an idle connection,
+  server killed with nothing in flight), the write loop just sits in
+  `rx.recv().await` forever, oblivious. This was caught during testing,
+  not theorized: killing a relay server with no message in flight left
+  the client reporting `Connected` indefinitely. The fix is a third
+  `tokio::select!` branch awaiting the read task's `JoinHandle` directly
+  -- when the read side ends for any reason (EOF, error, or explicit
+  abort), that's treated as a disconnect exactly like a failed write.
+- On every reconnect (not the first connect), `reset_peer_state` clears
+  the in-memory peer maps (`peer_identity_keys`, Olm/Megolm session maps)
+  before rejoining. The server assigns a fresh `PeerId` per connection, so
+  the old entries are keyed by IDs nobody will use again, and the
+  `Roster` the server sends right after rejoining repopulates everything
+  from scratch anyway. The identity `Account` and outbound Megolm
+  session are *not* reset -- they're what let a peer who already has our
+  key skip re-establishing a session with us after a blip on our end.
+- Messages sent while `Reconnecting` aren't dropped -- `send()` still
+  pushes onto the same unbounded `mpsc` channel the write loop drains, so
+  anything typed during an outage just sits queued and goes out the
+  moment the write loop resumes after a successful reconnect. This falls
+  out of the existing channel design for free; it wasn't a separate
+  feature to build.
+
+Verified via `FFISmokeTest`: killed a running relay server mid-session
+with no message in flight, watched `[state] reconnecting(attempt: N)`
+fire and increment, restarted the server, and watched it settle back to
+`[state] connected` -- proving both the backoff loop and the read-side
+detection fix. Also verified visually on the Android emulator: the
+"Reconnecting… (attempt N)" banner appears over the still-visible chat
+history (not a return to the connect form) and clears cleanly once the
+server comes back.
+
+The GUI implication: `ConnectionState` gained a `Reconnecting { attempt:
+u32 }` case, so every platform's UI switch needed to decide what to
+render for it. All three treat it as "stay on the chat view, don't kick
+back to the connect form" -- the chat history and crypto sessions are
+still intact, only the transport is down -- and show a small banner
+(`ContentView.swift`'s `chatView`, `MainScreen.kt`'s `ChatScreen`).
+
 ## Why the FFI bindings aren't committed
 
 `MessagingCoreFFI.xcframework` and `Sources/MessagingCore` are both

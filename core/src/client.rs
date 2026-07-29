@@ -25,7 +25,45 @@ pub enum ConnectionState {
     Disconnected,
     Connecting,
     Connected,
+    /// The connection dropped unexpectedly (not via `disconnect()`) and a
+    /// retry is scheduled with backoff. `attempt` is 1 on the first retry,
+    /// incrementing until a connection succeeds again.
+    Reconnecting { attempt: u32 },
     Failed { reason: String },
+}
+
+/// Delay before retry number `attempt` (1-indexed): 1s, 2s, 4s, 8s, 16s,
+/// capped at 30s so a long outage doesn't back off forever.
+fn backoff_delay(attempt: u32) -> std::time::Duration {
+    let secs = 1u64.checked_shl(attempt.saturating_sub(1)).unwrap_or(u64::MAX);
+    std::time::Duration::from_secs(secs.min(30))
+}
+
+/// Sleep for `dur`, waking early if `cancel` reports a disconnect. Returns
+/// `true` if it was woken by cancellation rather than the timer.
+async fn sleep_or_cancel(cancel: &mut tokio::sync::watch::Receiver<bool>, dur: std::time::Duration) -> bool {
+    if *cancel.borrow() {
+        return true;
+    }
+    tokio::select! {
+        _ = tokio::time::sleep(dur) => false,
+        _ = cancel.changed() => true,
+    }
+}
+
+/// Forget everything learned about peers in the previous connection. Called
+/// at the start of every (re)connect attempt after the first: the server
+/// assigns a fresh peer_id per connection, so old sessions are keyed by
+/// peer_ids nobody will send again, and the fresh `Roster` the server sends
+/// right after we (re)join will repopulate this from scratch anyway. Our own
+/// identity (`account`) and outbound Megolm session are untouched, so peers
+/// who already have our key don't need a redundant key exchange.
+fn reset_peer_state(state: &mut CryptoState) {
+    state.peer_identity_keys.clear();
+    state.peer_display_names.clear();
+    state.outbound_olm_sessions.clear();
+    state.inbound_olm_sessions.clear();
+    state.inbound_group_sessions.clear();
 }
 
 /// A single chat message or system notice, ready for display. Always
@@ -105,6 +143,10 @@ pub struct ConnectClient {
     outgoing: Mutex<Option<mpsc::UnboundedSender<ClientEvent>>>,
     crypto: Mutex<Option<SharedCrypto>>,
     listener: Mutex<Option<std::sync::Arc<dyn ConnectClientListener>>>,
+    /// Set by `disconnect()` to tell the background connection/retry loop to
+    /// stop -- an unexpected drop keeps retrying, but the user asking to
+    /// disconnect should not.
+    cancel: Mutex<Option<tokio::sync::watch::Sender<bool>>>,
 }
 
 #[uniffi::export]
@@ -116,6 +158,7 @@ impl ConnectClient {
             outgoing: Mutex::new(None),
             crypto: Mutex::new(None),
             listener: Mutex::new(None),
+            cancel: Mutex::new(None),
         })
     }
 
@@ -123,18 +166,11 @@ impl ConnectClient {
         let (tx, mut rx) = mpsc::unbounded_channel::<ClientEvent>();
         *self.outgoing.lock().unwrap() = Some(tx.clone());
 
-        let mut account = persistence::load_or_create_account(&self.data_dir);
-        let otk_result = account.generate_one_time_keys(1);
-        let one_time_key = otk_result
-            .created
-            .first()
-            .copied()
-            .expect("just asked for one one-time key");
-        account.mark_keys_as_published();
-        persistence::save_account(&self.data_dir, &account);
+        let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
+        *self.cancel.lock().unwrap() = Some(cancel_tx);
 
+        let account = persistence::load_or_create_account(&self.data_dir);
         let identity_key = account.curve25519_key().to_base64();
-        let one_time_key = one_time_key.to_base64();
         let outbound_group_session = GroupSession::new(Default::default());
         let known_peer_keys = persistence::load_known_peers(&self.data_dir);
 
@@ -165,102 +201,174 @@ impl ConnectClient {
 
         runtime().spawn(async move {
             let url = format!("ws://{host}:{port}/ws");
-            let ws_stream = match connect_async(&url).await {
-                Ok((stream, _)) => stream,
-                Err(err) => {
-                    listener.on_state_changed(ConnectionState::Failed {
-                        reason: err.to_string(),
-                    });
+            let mut attempt: u32 = 0;
+            let mut first_attempt = true;
+
+            loop {
+                if *cancel_rx.borrow() {
                     return;
                 }
-            };
-            let (mut write, mut read) = ws_stream.split();
 
-            let join = ClientEvent::Join {
-                display_name,
-                identity_key,
-                one_time_key,
-            };
-            let Ok(join_json) = serde_json::to_string(&join) else {
-                return;
-            };
-            if write.send(WsMessage::Text(join_json.into())).await.is_err() {
-                listener.on_state_changed(ConnectionState::Failed {
-                    reason: "failed to send join message".into(),
-                });
-                return;
-            }
-            listener.on_state_changed(ConnectionState::Connected);
-
-            let recv_listener = listener.clone();
-            let recv_crypto = crypto.clone();
-            let recv_tx = tx.clone();
-            let recv_task = tokio::spawn(async move {
-                while let Some(Ok(msg)) = read.next().await {
-                    let WsMessage::Text(text) = msg else { continue };
-                    let Ok(event) = serde_json::from_str::<ServerEvent>(&text) else {
+                let ws_stream = match connect_async(&url).await {
+                    Ok((stream, _)) => stream,
+                    Err(err) => {
+                        attempt += 1;
+                        listener.on_state_changed(if first_attempt {
+                            ConnectionState::Failed { reason: err.to_string() }
+                        } else {
+                            ConnectionState::Reconnecting { attempt }
+                        });
+                        if first_attempt || sleep_or_cancel(&mut cancel_rx, backoff_delay(attempt)).await {
+                            return;
+                        }
                         continue;
-                    };
+                    }
+                };
+                let (mut write, mut read) = ws_stream.split();
 
-                    match event {
-                        ServerEvent::Roster { peers } => {
-                            for peer in peers {
-                                handle_new_peer(&recv_crypto, &recv_tx, &recv_listener, &peer);
+                let (identity_key, one_time_key) = {
+                    let mut state = crypto.lock().unwrap();
+                    if !first_attempt {
+                        reset_peer_state(&mut state);
+                    }
+                    let otk_result = state.account.generate_one_time_keys(1);
+                    let one_time_key = otk_result
+                        .created
+                        .first()
+                        .copied()
+                        .expect("just asked for one one-time key");
+                    state.account.mark_keys_as_published();
+                    persistence::save_account(&state.data_dir, &state.account);
+                    (state.account.curve25519_key().to_base64(), one_time_key.to_base64())
+                };
+
+                let join = ClientEvent::Join {
+                    display_name: display_name.clone(),
+                    identity_key,
+                    one_time_key,
+                };
+                let Ok(join_json) = serde_json::to_string(&join) else {
+                    return;
+                };
+                if write.send(WsMessage::Text(join_json.into())).await.is_err() {
+                    attempt += 1;
+                    listener.on_state_changed(if first_attempt {
+                        ConnectionState::Failed { reason: "failed to send join message".into() }
+                    } else {
+                        ConnectionState::Reconnecting { attempt }
+                    });
+                    if first_attempt || sleep_or_cancel(&mut cancel_rx, backoff_delay(attempt)).await {
+                        return;
+                    }
+                    continue;
+                }
+
+                attempt = 0;
+                first_attempt = false;
+                listener.on_state_changed(ConnectionState::Connected);
+
+                let recv_listener = listener.clone();
+                let recv_crypto = crypto.clone();
+                let recv_tx = tx.clone();
+                let mut recv_task = tokio::spawn(async move {
+                    while let Some(Ok(msg)) = read.next().await {
+                        let WsMessage::Text(text) = msg else { continue };
+                        let Ok(event) = serde_json::from_str::<ServerEvent>(&text) else {
+                            continue;
+                        };
+
+                        match event {
+                            ServerEvent::Roster { peers } => {
+                                for peer in peers {
+                                    handle_new_peer(&recv_crypto, &recv_tx, &recv_listener, &peer);
+                                }
                             }
-                        }
-                        ServerEvent::PeerJoined { peer } => {
-                            let display_name = peer.display_name.clone();
-                            handle_new_peer(&recv_crypto, &recv_tx, &recv_listener, &peer);
-                            recv_listener.on_message(ChatMessage {
-                                from: String::new(),
-                                text: format!("{display_name} joined"),
-                                is_system: true,
-                            });
-                        }
-                        ServerEvent::PeerLeft { peer_id } => {
-                            let display_name = {
-                                let mut state = recv_crypto.lock().unwrap();
-                                state.outbound_olm_sessions.remove(&peer_id);
-                                state.inbound_olm_sessions.remove(&peer_id);
-                                state.inbound_group_sessions.remove(&peer_id);
-                                state.peer_identity_keys.remove(&peer_id);
-                                state.peer_display_names.remove(&peer_id)
-                            };
-                            if let Some(display_name) = display_name {
+                            ServerEvent::PeerJoined { peer } => {
+                                let display_name = peer.display_name.clone();
+                                handle_new_peer(&recv_crypto, &recv_tx, &recv_listener, &peer);
                                 recv_listener.on_message(ChatMessage {
                                     from: String::new(),
-                                    text: format!("{display_name} left"),
+                                    text: format!("{display_name} joined"),
                                     is_system: true,
                                 });
                             }
+                            ServerEvent::PeerLeft { peer_id } => {
+                                let display_name = {
+                                    let mut state = recv_crypto.lock().unwrap();
+                                    state.outbound_olm_sessions.remove(&peer_id);
+                                    state.inbound_olm_sessions.remove(&peer_id);
+                                    state.inbound_group_sessions.remove(&peer_id);
+                                    state.peer_identity_keys.remove(&peer_id);
+                                    state.peer_display_names.remove(&peer_id)
+                                };
+                                if let Some(display_name) = display_name {
+                                    recv_listener.on_message(ChatMessage {
+                                        from: String::new(),
+                                        text: format!("{display_name} left"),
+                                        is_system: true,
+                                    });
+                                }
+                            }
+                            ServerEvent::KeyExchange { from, ciphertext } => {
+                                handle_key_exchange(&recv_crypto, &from, &ciphertext);
+                            }
+                            ServerEvent::Message { from, ciphertext } => {
+                                if let Some((sender_name, text)) =
+                                    decrypt_message(&recv_crypto, &from, &ciphertext)
+                                {
+                                    recv_listener.on_message(ChatMessage {
+                                        from: sender_name,
+                                        text,
+                                        is_system: false,
+                                    });
+                                }
+                            }
                         }
-                        ServerEvent::KeyExchange { from, ciphertext } => {
-                            handle_key_exchange(&recv_crypto, &from, &ciphertext);
+                    }
+                });
+
+                loop {
+                    tokio::select! {
+                        event = rx.recv() => {
+                            match event {
+                                Some(event) => {
+                                    let Ok(json) = serde_json::to_string(&event) else {
+                                        continue;
+                                    };
+                                    if write.send(WsMessage::Text(json.into())).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                None => break,
+                            }
                         }
-                        ServerEvent::Message { from, ciphertext } => {
-                            if let Some((sender_name, text)) =
-                                decrypt_message(&recv_crypto, &from, &ciphertext)
-                            {
-                                recv_listener.on_message(ChatMessage {
-                                    from: sender_name,
-                                    text,
-                                    is_system: false,
-                                });
+                        // The read side ending (cleanly or with an error) is
+                        // just as much a disconnect as a failed write -- if
+                        // nothing was being sent when the peer went away,
+                        // `write.send` above would never fire and this would
+                        // be the only signal we get.
+                        _ = &mut recv_task => break,
+                        _ = cancel_rx.changed() => {
+                            if *cancel_rx.borrow() {
+                                recv_task.abort();
+                                let _ = write.close().await;
+                                return;
                             }
                         }
                     }
                 }
-            });
+                recv_task.abort();
 
-            while let Some(event) = rx.recv().await {
-                let Ok(json) = serde_json::to_string(&event) else {
-                    continue;
-                };
-                if write.send(WsMessage::Text(json.into())).await.is_err() {
-                    break;
+                if *cancel_rx.borrow() {
+                    return;
+                }
+
+                attempt += 1;
+                listener.on_state_changed(ConnectionState::Reconnecting { attempt });
+                if sleep_or_cancel(&mut cancel_rx, backoff_delay(attempt)).await {
+                    return;
                 }
             }
-            recv_task.abort();
         });
     }
 
@@ -290,6 +398,9 @@ impl ConnectClient {
     }
 
     pub fn disconnect(&self) {
+        if let Some(cancel_tx) = self.cancel.lock().unwrap().take() {
+            let _ = cancel_tx.send(true);
+        }
         *self.outgoing.lock().unwrap() = None;
         *self.crypto.lock().unwrap() = None;
         *self.listener.lock().unwrap() = None;

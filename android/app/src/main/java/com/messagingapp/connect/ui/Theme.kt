@@ -11,4 +11,5 @@ object Solarized {
     val base01 = Color(0xFF586E75) // emphasized text
     val blue = Color(0xFF268BD2)
     val red = Color(0xFFDC322F)
+    val yellow = Color(0xFFB58900)
 }
