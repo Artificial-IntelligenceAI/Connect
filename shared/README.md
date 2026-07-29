@@ -21,6 +21,46 @@ A local Swift Package (`ConnectKit/`) with three targets:
   `MessagingCore.ConnectClient` directly, no UI involved. See the root
   [README](../README.md#testing-the-rust-swift-ffi-directly).
 
+## Automated tests (`core/src`)
+
+`cargo test -p messaging-core` runs the Rust core's test suite --
+`core/src/client.rs` and `core/src/persistence.rs` each have a
+`#[cfg(test)] mod tests` at the bottom. Nothing here spins up a real
+server or WebSocket; the crypto/protocol logic is factored into plain
+functions (`handle_new_peer`, `handle_key_exchange`, `decrypt_message`,
+`backoff_delay`, `reset_peer_state`, ...) that take a `SharedCrypto`
+directly, so tests call them the same way `connect()`'s event loop does,
+just without a socket in between. Coverage so far:
+
+- **`client.rs`**: a full two-party Olm handshake + bidirectional Megolm
+  message roundtrip (`full_handshake_and_message_roundtrip_both_directions`
+  -- this is the scenario the outbound/inbound-session-map bug from the
+  original E2EE implementation would have broken); all three TOFU
+  outcomes (new contact, unchanged key on reconnect, changed key
+  warning); `backoff_delay`'s growth/cap; `sleep_or_cancel`'s two exit
+  paths (timer vs. cancellation, via `#[tokio::test]`); `reset_peer_state`
+  clearing peer maps but not identity.
+- **`persistence.rs`**: identity persists across repeated
+  `load_or_create_account` calls against the same `data_dir` and differs
+  across different dirs; `known_peers.json` round-trips; missing files
+  default to empty rather than erroring; `format_fingerprint`'s chunking,
+  including odd lengths and the empty string.
+
+Tests that touch disk use `std::env::temp_dir()` with a `Uuid::new_v4()`
+suffix per test (not a shared fixture directory) so they can run
+concurrently without racing each other.
+
+**Not covered yet**: the actual `tokio_tungstenite` WebSocket loop inside
+`connect()` (the retry/backoff *logic* is tested via `backoff_delay` and
+`sleep_or_cancel` directly, but the surrounding `connect_async`/`select!`
+state machine itself isn't exercised by an automated test) and the
+`server/` crate has no tests of its own yet. `FFISmokeTest` remains the
+way to exercise the real network path end to end (see below and the root
+README) -- these two are complementary, not redundant: unit tests catch
+protocol/crypto logic bugs fast and without a server running, while
+`FFISmokeTest` is what actually proves the wire format, backoff timing,
+and platform FFI bindings work together for real.
+
 ## End-to-end encryption (`core/src/client.rs`)
 
 Implemented via [`vodozemac`](https://github.com/matrix-org/vodozemac),

@@ -544,3 +544,250 @@ fn decrypt_message(crypto: &SharedCrypto, from: &PeerId, ciphertext: &str) -> Op
         .unwrap_or_else(|| "unknown".to_string());
     Some((sender_name, text))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct TestListener {
+        messages: Mutex<Vec<ChatMessage>>,
+        states: Mutex<Vec<ConnectionState>>,
+    }
+
+    impl ConnectClientListener for TestListener {
+        fn on_state_changed(&self, state: ConnectionState) {
+            self.states.lock().unwrap().push(state);
+        }
+        fn on_message(&self, message: ChatMessage) {
+            self.messages.lock().unwrap().push(message);
+        }
+    }
+
+    /// A throwaway data_dir under the OS temp directory, unique per call --
+    /// `handle_new_peer` persists known-peer keys as a side effect, and an
+    /// empty/relative data_dir would resolve against the test binary's CWD
+    /// (the crate root under `cargo test`), leaving stray JSON files in the
+    /// repo instead of a real sandboxed directory.
+    fn temp_data_dir() -> String {
+        std::env::temp_dir()
+            .join(format!("connect-client-test-{}", uuid::Uuid::new_v4()))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn new_crypto(display_name: &str) -> SharedCrypto {
+        std::sync::Arc::new(Mutex::new(CryptoState {
+            account: Account::new(),
+            display_name: display_name.to_string(),
+            data_dir: temp_data_dir(),
+            outbound_group_session: GroupSession::new(Default::default()),
+            peer_identity_keys: HashMap::new(),
+            peer_display_names: HashMap::new(),
+            known_peer_keys: HashMap::new(),
+            outbound_olm_sessions: HashMap::new(),
+            inbound_olm_sessions: HashMap::new(),
+            inbound_group_sessions: HashMap::new(),
+        }))
+    }
+
+    /// Publishes a one-time key the way `connect()` would and returns the
+    /// `PeerInfo` this crypto state would announce to the room under
+    /// `peer_id`.
+    fn announce(crypto: &SharedCrypto, peer_id: &str) -> PeerInfo {
+        let mut state = crypto.lock().unwrap();
+        let identity_key = state.account.curve25519_key().to_base64();
+        let display_name = state.display_name.clone();
+        let otk_result = state.account.generate_one_time_keys(1);
+        let one_time_key = otk_result.created.first().copied().unwrap().to_base64();
+        state.account.mark_keys_as_published();
+        PeerInfo {
+            peer_id: peer_id.to_string(),
+            display_name,
+            identity_key,
+            one_time_key,
+        }
+    }
+
+    #[test]
+    fn backoff_delay_grows_exponentially_and_caps_at_30s() {
+        assert_eq!(backoff_delay(1), std::time::Duration::from_secs(1));
+        assert_eq!(backoff_delay(2), std::time::Duration::from_secs(2));
+        assert_eq!(backoff_delay(3), std::time::Duration::from_secs(4));
+        assert_eq!(backoff_delay(4), std::time::Duration::from_secs(8));
+        assert_eq!(backoff_delay(5), std::time::Duration::from_secs(16));
+        assert_eq!(backoff_delay(6), std::time::Duration::from_secs(30)); // would be 32 uncapped
+        assert_eq!(backoff_delay(20), std::time::Duration::from_secs(30));
+    }
+
+    #[tokio::test]
+    async fn sleep_or_cancel_returns_false_when_the_timer_elapses() {
+        let (_tx, mut rx) = tokio::sync::watch::channel(false);
+        let cancelled = sleep_or_cancel(&mut rx, std::time::Duration::from_millis(5)).await;
+        assert!(!cancelled);
+    }
+
+    #[tokio::test]
+    async fn sleep_or_cancel_wakes_early_and_returns_true_on_cancel() {
+        let (tx, mut rx) = tokio::sync::watch::channel(false);
+        let waiter = tokio::spawn(async move {
+            sleep_or_cancel(&mut rx, std::time::Duration::from_secs(30)).await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        tx.send(true).unwrap();
+        assert!(waiter.await.unwrap());
+    }
+
+    #[test]
+    fn reset_peer_state_clears_per_peer_maps_but_keeps_identity() {
+        let crypto = new_crypto("Alice");
+        let identity_before = {
+            let mut state = crypto.lock().unwrap();
+            let key = state.account.curve25519_key();
+            state.peer_identity_keys.insert("p1".into(), key);
+            state.peer_display_names.insert("p1".into(), "Someone".into());
+            state.account.curve25519_key().to_base64()
+        };
+
+        reset_peer_state(&mut crypto.lock().unwrap());
+
+        let state = crypto.lock().unwrap();
+        assert!(state.peer_identity_keys.is_empty());
+        assert!(state.peer_display_names.is_empty());
+        assert_eq!(state.account.curve25519_key().to_base64(), identity_before);
+    }
+
+    /// The core value proposition, exercised end to end without a server:
+    /// two independent crypto states learn about each other, exchange Olm
+    /// key material, and can then decrypt each other's Megolm chat
+    /// messages -- in both directions.
+    #[test]
+    fn full_handshake_and_message_roundtrip_both_directions() {
+        let alice = new_crypto("Alice");
+        let bob = new_crypto("Bob");
+        let alice_info = announce(&alice, "alice-peer");
+        let bob_info = announce(&bob, "bob-peer");
+
+        let (alice_tx, mut alice_rx) = mpsc::unbounded_channel::<ClientEvent>();
+        let (bob_tx, mut bob_rx) = mpsc::unbounded_channel::<ClientEvent>();
+        let alice_listener: std::sync::Arc<dyn ConnectClientListener> =
+            std::sync::Arc::new(TestListener::default());
+        let bob_listener: std::sync::Arc<dyn ConnectClientListener> =
+            std::sync::Arc::new(TestListener::default());
+
+        // Each side learns about the other (as if from a Roster/PeerJoined
+        // event) and fires off an Olm-encrypted Megolm key exchange.
+        handle_new_peer(&alice, &alice_tx, &alice_listener, &bob_info);
+        handle_new_peer(&bob, &bob_tx, &bob_listener, &alice_info);
+
+        let alice_to_bob = match alice_rx.try_recv().unwrap() {
+            ClientEvent::KeyExchange { to, ciphertext } => {
+                assert_eq!(to, "bob-peer");
+                ciphertext
+            }
+            other => panic!("expected a KeyExchange, got {other:?}"),
+        };
+        let bob_to_alice = match bob_rx.try_recv().unwrap() {
+            ClientEvent::KeyExchange { to, ciphertext } => {
+                assert_eq!(to, "alice-peer");
+                ciphertext
+            }
+            other => panic!("expected a KeyExchange, got {other:?}"),
+        };
+
+        // Deliver each side's key exchange to the other, establishing
+        // inbound Olm sessions and, from them, inbound Megolm sessions.
+        handle_key_exchange(&bob, &"alice-peer".to_string(), &alice_to_bob);
+        handle_key_exchange(&alice, &"bob-peer".to_string(), &bob_to_alice);
+
+        let ciphertext = {
+            let mut state = alice.lock().unwrap();
+            state.outbound_group_session.encrypt("hello bob").to_base64()
+        };
+        let (sender, text) = decrypt_message(&bob, &"alice-peer".to_string(), &ciphertext)
+            .expect("bob should be able to decrypt alice's message");
+        assert_eq!(sender, "Alice");
+        assert_eq!(text, "hello bob");
+
+        let ciphertext = {
+            let mut state = bob.lock().unwrap();
+            state.outbound_group_session.encrypt("hi alice").to_base64()
+        };
+        let (sender, text) = decrypt_message(&alice, &"bob-peer".to_string(), &ciphertext)
+            .expect("alice should be able to decrypt bob's message");
+        assert_eq!(sender, "Bob");
+        assert_eq!(text, "hi alice");
+    }
+
+    #[test]
+    fn decrypt_message_from_a_peer_with_no_session_returns_none() {
+        let alice = new_crypto("Alice");
+        assert!(decrypt_message(&alice, &"nobody".to_string(), "not-real-ciphertext").is_none());
+    }
+
+    #[test]
+    fn tofu_first_contact_is_remembered_with_a_new_contact_notice() {
+        let alice = new_crypto("Alice");
+        let bob = new_crypto("Bob");
+        let bob_info = announce(&bob, "bob-peer");
+
+        let (tx, _rx) = mpsc::unbounded_channel::<ClientEvent>();
+        let listener = std::sync::Arc::new(TestListener::default());
+        let dyn_listener: std::sync::Arc<dyn ConnectClientListener> = listener.clone();
+        handle_new_peer(&alice, &tx, &dyn_listener, &bob_info);
+
+        let messages = listener.messages.lock().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].text.contains("New contact"));
+        assert_eq!(
+            alice.lock().unwrap().known_peer_keys.get("Bob"),
+            Some(&bob_info.identity_key)
+        );
+    }
+
+    #[test]
+    fn tofu_unchanged_key_on_reconnect_is_silent() {
+        let alice = new_crypto("Alice");
+        let bob = new_crypto("Bob");
+        let bob_info = announce(&bob, "bob-peer");
+
+        let (tx, _rx) = mpsc::unbounded_channel::<ClientEvent>();
+        let listener = std::sync::Arc::new(TestListener::default());
+        let dyn_listener: std::sync::Arc<dyn ConnectClientListener> = listener.clone();
+
+        handle_new_peer(&alice, &tx, &dyn_listener, &bob_info);
+        // Bob reconnects: same identity key, but the server hands out a
+        // fresh peer_id for the new connection.
+        let mut bob_info_again = bob_info.clone();
+        bob_info_again.peer_id = "bob-peer-2".into();
+        handle_new_peer(&alice, &tx, &dyn_listener, &bob_info_again);
+
+        assert_eq!(
+            listener.messages.lock().unwrap().len(),
+            1,
+            "an unchanged identity key on reconnect should not raise a second notice"
+        );
+    }
+
+    #[test]
+    fn tofu_changed_key_for_a_known_name_raises_a_warning() {
+        let alice = new_crypto("Alice");
+        let bob = new_crypto("Bob");
+        let bob_info = announce(&bob, "bob-peer");
+
+        let (tx, _rx) = mpsc::unbounded_channel::<ClientEvent>();
+        let listener = std::sync::Arc::new(TestListener::default());
+        let dyn_listener: std::sync::Arc<dyn ConnectClientListener> = listener.clone();
+        handle_new_peer(&alice, &tx, &dyn_listener, &bob_info);
+
+        // Someone else (or a fresh install) shows up using Bob's name with
+        // a different identity key.
+        let impostor = new_crypto("Bob");
+        let impostor_info = announce(&impostor, "bob-peer-2");
+        handle_new_peer(&alice, &tx, &dyn_listener, &impostor_info);
+
+        let messages = listener.messages.lock().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert!(messages[1].text.contains("identity key has changed"));
+    }
+}

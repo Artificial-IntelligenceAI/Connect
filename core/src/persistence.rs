@@ -63,3 +63,68 @@ pub fn format_fingerprint(base64_key: &str) -> String {
         .collect::<Vec<_>>()
         .join(" ")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fresh, collision-proof scratch directory for one test -- persisted
+    /// files are on real disk, so tests can't share a directory without
+    /// racing each other.
+    fn temp_dir(label: &str) -> String {
+        std::env::temp_dir()
+            .join(format!("connect-persistence-test-{label}-{}", uuid::Uuid::new_v4()))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[test]
+    fn format_fingerprint_groups_into_four_character_chunks() {
+        assert_eq!(format_fingerprint("abcdefgh"), "abcd efgh");
+        assert_eq!(format_fingerprint("abcdefg"), "abcd efg");
+        assert_eq!(format_fingerprint("abc"), "abc");
+        assert_eq!(format_fingerprint(""), "");
+    }
+
+    #[test]
+    fn load_or_create_account_persists_identity_across_calls() {
+        let dir = temp_dir("identity");
+        let first = load_or_create_account(&dir);
+        let second = load_or_create_account(&dir);
+        assert_eq!(
+            first.curve25519_key().to_base64(),
+            second.curve25519_key().to_base64(),
+            "reloading from the same data_dir should return the same identity"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_or_create_account_generates_distinct_identities_per_dir() {
+        let dir_a = temp_dir("identity-a");
+        let dir_b = temp_dir("identity-b");
+        let a = load_or_create_account(&dir_a);
+        let b = load_or_create_account(&dir_b);
+        assert_ne!(a.curve25519_key().to_base64(), b.curve25519_key().to_base64());
+        let _ = fs::remove_dir_all(&dir_a);
+        let _ = fs::remove_dir_all(&dir_b);
+    }
+
+    #[test]
+    fn known_peers_round_trip_through_disk() {
+        let dir = temp_dir("known-peers");
+        let mut peers = HashMap::new();
+        peers.insert("Alice".to_string(), "some-base64-identity-key".to_string());
+        peers.insert("Bob".to_string(), "another-base64-identity-key".to_string());
+
+        save_known_peers(&dir, &peers);
+        assert_eq!(load_known_peers(&dir), peers);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_known_peers_defaults_to_empty_when_nothing_saved_yet() {
+        let dir = temp_dir("no-peers-yet");
+        assert!(load_known_peers(&dir).is_empty());
+    }
+}
