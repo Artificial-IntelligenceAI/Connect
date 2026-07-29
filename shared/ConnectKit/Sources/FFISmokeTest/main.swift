@@ -5,7 +5,12 @@
 // instances with different display names to verify real encrypted
 // peer-to-peer delivery, not just a loopback.
 //
-// Usage: swift run FFISmokeTest [displayName] [host] [port]
+// Identity is persisted per dataDirTag (defaults to displayName), under
+// a temp directory -- re-running with the same tag reuses the same
+// identity (test persistence), a different tag gets a fresh one (test
+// the key-changed warning by reusing a displayName with a different tag).
+//
+// Usage: swift run FFISmokeTest [displayName] [host] [port] [dataDirTag]
 
 import Foundation
 import MessagingCore
@@ -35,9 +40,15 @@ let args = CommandLine.arguments
 let displayName = args.count > 1 ? args[1] : "FFISmokeTest"
 let host = args.count > 2 ? args[2] : "127.0.0.1"
 let port = args.count > 3 ? UInt16(args[3]) ?? 7878 : 7878
+let dataDirTag = args.count > 4 ? args[4] : displayName
+
+let dataDir = FileManager.default.temporaryDirectory
+    .appendingPathComponent("ConnectSmokeTest", isDirectory: true)
+    .appendingPathComponent(dataDirTag, isDirectory: true)
+try? FileManager.default.createDirectory(at: dataDir, withIntermediateDirectories: true)
 
 let listener = TestListener()
-let client = ConnectClient()
+let client = ConnectClient(dataDir: dataDir.path)
 
 print("Connecting to \(host):\(port) as \(displayName)...")
 client.connect(host: host, port: port, displayName: displayName, listener: listener)

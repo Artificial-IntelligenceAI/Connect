@@ -1,5 +1,6 @@
 package com.messagingapp.connect.ui
 
+import android.content.Context
 import android.os.Handler
 import android.os.Looper
 import androidx.compose.runtime.getValue
@@ -25,12 +26,14 @@ sealed class ConnectionState {
  * callback interface and republishes events as Compose state. Mirrors
  * shared/ConnectKit/Sources/ConnectKit/NetworkClient.swift.
  */
-class NetworkClient {
+class NetworkClient(context: Context) {
     var state: ConnectionState by mutableStateOf(ConnectionState.Disconnected)
         private set
     val messages = mutableStateListOf<ChatMessage>()
 
-    private val client = ConnectClient()
+    // Context.filesDir is already app-private/sandboxed by Android, same
+    // role as the app support directory on Apple platforms.
+    private val client = ConnectClient(context.filesDir.absolutePath)
     private val mainHandler = Handler(Looper.getMainLooper())
     private var nextMessageId = 0L
 

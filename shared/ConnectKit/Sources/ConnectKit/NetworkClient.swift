@@ -15,12 +15,23 @@ enum ConnectionState: Equatable {
     case failed(String)
 }
 
+/// Where this client's identity and known-peer-keys get persisted. Same
+/// directory works for macOS and iOS -- the app support dir is already
+/// sandboxed per-app on both platforms.
+private func defaultDataDirectory() -> String {
+    let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+        ?? FileManager.default.temporaryDirectory
+    let dir = base.appendingPathComponent("Connect", isDirectory: true)
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    return dir.path
+}
+
 @MainActor
 final class NetworkClient: ObservableObject {
     @Published var messages: [ChatMessage] = []
     @Published var state: ConnectionState = .disconnected
 
-    private let client = MessagingCore.ConnectClient()
+    private let client = MessagingCore.ConnectClient(dataDir: defaultDataDirectory())
     private var listener: Listener?
 
     func connect(host: String, port: Int, displayName: String) {

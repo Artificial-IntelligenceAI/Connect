@@ -9,6 +9,7 @@ use vodozemac::olm::{Account, OlmMessage};
 use vodozemac::megolm::{GroupSession, InboundGroupSession, MegolmMessage, SessionKey};
 use vodozemac::Curve25519PublicKey;
 
+use crate::persistence;
 use crate::{ClientEvent, PeerId, PeerInfo, ServerEvent};
 
 fn runtime() -> &'static tokio::runtime::Runtime {
@@ -52,20 +53,30 @@ pub trait ConnectClientListener: Send + Sync {
 /// Uses vodozemac's Olm (pairwise, X3DH-style) to privately hand each peer
 /// our Megolm outbound session key, then Megolm (group ratchet) to encrypt
 /// the actual chat messages once per send rather than once per recipient.
-/// This is the same architecture Matrix uses. Known, deliberate limitations
-/// for this v1: identity keys are generated fresh per connection (nothing is
-/// persisted across app restarts, so there's no cross-session key
-/// continuity/verification), and each client only ever publishes a single
-/// Olm one-time key, which -- unlike textbook X3DH -- gets reused if more
-/// than one peer establishes a session with us before we reconnect. Message
-/// history isn't available to late joiners (true even before E2EE existed:
-/// the server never stored anything).
+/// This is the same architecture Matrix uses.
+///
+/// The identity (`account`) is persisted to `data_dir` and reloaded across
+/// restarts (see persistence.rs), and `known_peer_keys` is a
+/// trust-on-first-use store keyed by display name -- if a name we've seen
+/// before shows up with a different identity key, that's surfaced to the
+/// listener as a system-message warning rather than silently accepted.
+/// Known, deliberate limitations still remaining for this v1: each client
+/// only ever publishes a single Olm one-time key, which -- unlike textbook
+/// X3DH -- gets reused if more than one peer establishes a session with us
+/// before we reconnect; TOFU is anchored to display name, so a peer
+/// impersonating an existing name from a fresh identity looks identical to
+/// that peer just changing devices (no stronger identity than "the name
+/// someone typed in"). Message history isn't available to late joiners
+/// (true even before E2EE existed: the server never stored anything).
 struct CryptoState {
     account: Account,
     display_name: String,
+    data_dir: String,
     outbound_group_session: GroupSession,
     peer_identity_keys: HashMap<PeerId, Curve25519PublicKey>,
     peer_display_names: HashMap<PeerId, String>,
+    /// display_name -> base64 identity key, persisted to disk.
+    known_peer_keys: HashMap<String, String>,
     // Deliberately two separate maps, not one keyed by peer_id: the Olm
     // session we create to *send* a peer our Megolm key is a different
     // object from the one we create to *decrypt* the Megolm key they send
@@ -85,6 +96,12 @@ type SharedCrypto = std::sync::Arc<Mutex<CryptoState>>;
 /// ciphertext for `Message`/`KeyExchange` traffic.
 #[derive(uniffi::Object)]
 pub struct ConnectClient {
+    /// Directory this client's identity and known-peer-keys are persisted
+    /// to. Must be a writable, platform-sandboxed directory (app support
+    /// dir on Apple platforms, `Context.filesDir` on Android) -- the Rust
+    /// core has no notion of "the right place" on any given OS, so the
+    /// platform layer is responsible for supplying it.
+    data_dir: String,
     outgoing: Mutex<Option<mpsc::UnboundedSender<ClientEvent>>>,
     crypto: Mutex<Option<SharedCrypto>>,
     listener: Mutex<Option<std::sync::Arc<dyn ConnectClientListener>>>,
@@ -93,8 +110,9 @@ pub struct ConnectClient {
 #[uniffi::export]
 impl ConnectClient {
     #[uniffi::constructor]
-    pub fn new() -> std::sync::Arc<Self> {
+    pub fn new(data_dir: String) -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self {
+            data_dir,
             outgoing: Mutex::new(None),
             crypto: Mutex::new(None),
             listener: Mutex::new(None),
@@ -105,7 +123,7 @@ impl ConnectClient {
         let (tx, mut rx) = mpsc::unbounded_channel::<ClientEvent>();
         *self.outgoing.lock().unwrap() = Some(tx.clone());
 
-        let mut account = Account::new();
+        let mut account = persistence::load_or_create_account(&self.data_dir);
         let otk_result = account.generate_one_time_keys(1);
         let one_time_key = otk_result
             .created
@@ -113,17 +131,21 @@ impl ConnectClient {
             .copied()
             .expect("just asked for one one-time key");
         account.mark_keys_as_published();
+        persistence::save_account(&self.data_dir, &account);
 
         let identity_key = account.curve25519_key().to_base64();
         let one_time_key = one_time_key.to_base64();
         let outbound_group_session = GroupSession::new(Default::default());
+        let known_peer_keys = persistence::load_known_peers(&self.data_dir);
 
         let crypto: SharedCrypto = std::sync::Arc::new(Mutex::new(CryptoState {
             account,
             display_name: display_name.clone(),
+            data_dir: self.data_dir.clone(),
             outbound_group_session,
             peer_identity_keys: HashMap::new(),
             peer_display_names: HashMap::new(),
+            known_peer_keys,
             outbound_olm_sessions: HashMap::new(),
             inbound_olm_sessions: HashMap::new(),
             inbound_group_sessions: HashMap::new(),
@@ -132,6 +154,14 @@ impl ConnectClient {
         *self.listener.lock().unwrap() = Some(listener.clone());
 
         listener.on_state_changed(ConnectionState::Connecting);
+        listener.on_message(ChatMessage {
+            from: String::new(),
+            text: format!(
+                "Your fingerprint: {}",
+                persistence::format_fingerprint(&identity_key)
+            ),
+            is_system: true,
+        });
 
         runtime().spawn(async move {
             let url = format!("ws://{host}:{port}/ws");
@@ -175,12 +205,12 @@ impl ConnectClient {
                     match event {
                         ServerEvent::Roster { peers } => {
                             for peer in peers {
-                                handle_new_peer(&recv_crypto, &recv_tx, &peer);
+                                handle_new_peer(&recv_crypto, &recv_tx, &recv_listener, &peer);
                             }
                         }
                         ServerEvent::PeerJoined { peer } => {
                             let display_name = peer.display_name.clone();
-                            handle_new_peer(&recv_crypto, &recv_tx, &peer);
+                            handle_new_peer(&recv_crypto, &recv_tx, &recv_listener, &peer);
                             recv_listener.on_message(ChatMessage {
                                 from: String::new(),
                                 text: format!("{display_name} joined"),
@@ -266,10 +296,17 @@ impl ConnectClient {
     }
 }
 
-/// Learn a peer's identity key, and (if we haven't already) establish an
-/// outbound Olm session to them and hand them our Megolm session key
-/// through it, so they can decrypt messages we send from now on.
-fn handle_new_peer(crypto: &SharedCrypto, tx: &mpsc::UnboundedSender<ClientEvent>, peer: &PeerInfo) {
+/// Learn a peer's identity key -- checking it against what we've seen for
+/// that display name before (trust-on-first-use) -- and, if we haven't
+/// already, establish an outbound Olm session to them and hand them our
+/// Megolm session key through it, so they can decrypt messages we send
+/// from now on.
+fn handle_new_peer(
+    crypto: &SharedCrypto,
+    tx: &mpsc::UnboundedSender<ClientEvent>,
+    listener: &std::sync::Arc<dyn ConnectClientListener>,
+    peer: &PeerInfo,
+) {
     let Ok(identity_key) = Curve25519PublicKey::from_base64(&peer.identity_key) else {
         return;
     };
@@ -283,6 +320,38 @@ fn handle_new_peer(crypto: &SharedCrypto, tx: &mpsc::UnboundedSender<ClientEvent
         .peer_display_names
         .insert(peer.peer_id.clone(), peer.display_name.clone());
 
+    let verification_notice = match state.known_peer_keys.get(&peer.display_name) {
+        Some(known_key) if known_key == &peer.identity_key => None,
+        Some(_different_key) => Some(format!(
+            "\u{26A0}\u{FE0F} {}'s identity key has changed since last time -- \
+             could be a new device, could be someone else using that name. \
+             New fingerprint: {}",
+            peer.display_name,
+            persistence::format_fingerprint(&peer.identity_key)
+        )),
+        None => Some(format!(
+            "\u{1F511} New contact: {}. Fingerprint: {}",
+            peer.display_name,
+            persistence::format_fingerprint(&peer.identity_key)
+        )),
+    };
+    state
+        .known_peer_keys
+        .insert(peer.display_name.clone(), peer.identity_key.clone());
+    let data_dir = state.data_dir.clone();
+    let known_peers_snapshot = state.known_peer_keys.clone();
+    drop(state);
+
+    persistence::save_known_peers(&data_dir, &known_peers_snapshot);
+    if let Some(text) = verification_notice {
+        listener.on_message(ChatMessage {
+            from: String::new(),
+            text,
+            is_system: true,
+        });
+    }
+
+    let mut state = crypto.lock().unwrap();
     if state.outbound_olm_sessions.contains_key(&peer.peer_id) {
         return;
     }

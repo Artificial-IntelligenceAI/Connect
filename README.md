@@ -13,15 +13,29 @@ A messaging app. Cross-platform and end-to-end encrypted.
   Swift/Kotlin bindings get generated.
 - **End-to-end encryption is implemented**, via
   [`vodozemac`](https://github.com/matrix-org/vodozemac) — the same
-  Olm (pairwise)/Megolm (group) design Matrix uses. Each client generates
-  an Olm identity per connection, uses it to privately hand every other
-  peer in the room its Megolm session key, then encrypts actual chat
-  messages with Megolm once per send rather than once per recipient. The
-  server only ever relays ciphertext for message/key-exchange traffic —
-  see `core/src/client.rs` for the full design and its documented v1
-  limitations (keys aren't persisted across restarts, one-time keys are
-  reused across peers, and a message can arrive before its key exchange
-  completes and be silently dropped rather than retried).
+  Olm (pairwise)/Megolm (group) design Matrix uses. Each client has a
+  persistent Olm identity (see below), uses it to privately hand every
+  other peer in the room its Megolm session key, then encrypts actual
+  chat messages with Megolm once per send rather than once per recipient.
+  The server only ever relays ciphertext for message/key-exchange traffic
+  — see `core/src/client.rs` for the full design and its documented v1
+  limitations (one-time keys are reused across peers rather than consumed
+  once each, and a message can arrive before its key exchange completes
+  and be silently dropped rather than retried).
+- **Identity is persisted, with trust-on-first-use key-change warnings.**
+  Each `ConnectClient` is constructed with a `data_dir` (a platform-
+  supplied, sandboxed writable directory); its Olm identity is pickled to
+  a file there and reloaded on every subsequent launch, so a given
+  install has one stable identity rather than a new one every connection.
+  Every contact's identity key, keyed by display name, is remembered the
+  same way -- if a name you've talked to before shows up with a
+  *different* key, that's surfaced as a system-message warning in the
+  chat (not a hard block) rather than silently trusted. Both files are
+  plain, unencrypted JSON relying on OS-level app-sandbox permissions for
+  protection, not at-rest encryption -- a hardening candidate later. See
+  "End-to-end encryption" in [shared/README.md](shared/README.md) for the
+  full design and known limitations (TOFU is anchored to display name,
+  which anyone can type, not a stronger identity).
 - **Server (Rust, Axum, `server/`):** routes ciphertext between connected
   clients — broadcasts chat messages and peer-joined/left events to the
   room, and delivers key-exchange messages point-to-point to the specific
@@ -145,10 +159,14 @@ with different display names to see real encrypted delivery between
 them, not just a local echo). Useful for verifying the FFI/crypto layer
 itself without fighting a GUI, or for testing on iOS via `xcrun simctl
 spawn <udid> <path-to-built-binary>` since it needs no Simulator UI
-interaction at all:
+interaction at all. Identity persists per `dataDirTag` (defaults to
+`displayName`) under a temp directory — run twice with the same tag to
+confirm persistence (same fingerprint printed both times), or with the
+same `displayName` but a different tag to trigger the key-changed
+warning:
 
 ```bash
-cd shared/ConnectKit && swift run FFISmokeTest [displayName] [host] [port]
+cd shared/ConnectKit && swift run FFISmokeTest [displayName] [host] [port] [dataDirTag]
 ```
 
 ## License

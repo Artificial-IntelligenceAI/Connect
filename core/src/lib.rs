@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 uniffi::setup_scaffolding!();
 
 mod client;
+mod persistence;
 pub use client::{ChatMessage, ConnectClient, ConnectClientListener, ConnectionState};
 
 /// Server-assigned per-connection identifier.

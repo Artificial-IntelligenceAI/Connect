@@ -33,11 +33,13 @@ a per-platform one.
 
 **Protocol**, per connection:
 
-1. On `connect()`, the client generates a fresh `vodozemac::olm::Account`
-   (Curve25519 identity + Ed25519 signing key) and one Olm one-time key,
-   and creates a Megolm `GroupSession` for messages it's about to send.
-   The identity key and one-time key (both base64) go out in the `Join`
-   message.
+1. On `connect()`, the client loads its persisted `vodozemac::olm::Account`
+   (Curve25519 identity + Ed25519 signing key) from `data_dir` -- creating
+   and saving a new one on first-ever launch -- generates one fresh Olm
+   one-time key for this connection, and creates a Megolm `GroupSession`
+   for messages it's about to send. The identity key and one-time key
+   (both base64) go out in the `Join` message. See "Identity persistence
+   and verification" below for the persistence/TOFU design.
 2. The server tracks connected peers and their published keys
    (`PeerInfo`), and on join sends the new client a `Roster` of everyone
    already in the room, and broadcasts a `PeerJoined` to everyone else.
@@ -72,12 +74,58 @@ and fails. `CryptoState` keeps them in two separate maps
 of this; it was the actual root cause the first time this was end-to-end
 tested and messages silently weren't arriving.
 
+## Identity persistence and verification (`core/src/persistence.rs`)
+
+`ConnectClient::new(dataDir)` takes a platform-supplied, writable,
+already-sandboxed directory (Apple: `FileManager`'s
+`.applicationSupportDirectory`; Android: `Context.filesDir`) and uses it
+for two files:
+
+- **`identity.json`** -- the account's `pickle()`, reloaded on the next
+  `connect()` instead of generating a new identity every time. This is
+  what makes "this contact's key changed" detection possible at all: a
+  key comparison is meaningless if the key is different every session
+  regardless of whether anything suspicious happened.
+- **`known_peers.json`** -- a trust-on-first-use map of `display_name ->
+  identity_key`, updated in `handle_new_peer` every time a peer's
+  `PeerInfo` is seen. First time a name is seen: silently remembered
+  (well, not *silently* -- a "New contact" system message with their
+  fingerprint is shown, so there's at least something to compare against
+  out-of-band). Same name, same key on a later connection: no notice,
+  nothing changed. Same name, *different* key: a
+  "\u{26A0}\u{FE0F} ...identity key has changed..." system message, with
+  the new fingerprint -- non-blocking, the session still gets established
+  either way, matching how mainstream E2EE apps handle this (warn, don't
+  hard-block).
+
+Fingerprints are just the base64 identity key, grouped in 4-character
+chunks for readability (`format_fingerprint`) -- not a hash-based safety
+number like Signal/Matrix compute from *both* parties' keys, just the raw
+key formatted for a human to eyeball or read aloud. Both your own
+fingerprint (shown once per `connect()`) and a new/changed contact's are
+delivered as ordinary `ChatMessage { is_system: true }` values -- no new
+FFI surface, no new UI code on any platform, they just show up in the
+existing chat-message list like a join/leave notice does.
+
+Both JSON files are **unencrypted at rest** -- protection is entirely
+"the OS won't let another app read your app's sandboxed directory," not
+actual encryption of the identity material. A real hardening pass would
+tie this to platform Keychain/Keystore instead of a plain file.
+
+Verified end-to-end via `FFISmokeTest`'s `dataDirTag` option (see the
+root README): same tag across two separate process runs reproduces the
+identical fingerprint (persistence confirmed), and reusing a
+`displayName` with a *different* tag against a persistent observer
+correctly triggers the key-changed warning on the second connection.
+
 **Known, deliberate v1 limitations** (see also the doc comment on
 `CryptoState`):
-- Identity keys are generated fresh every connection -- nothing is
-  persisted across app restarts, so there's no cross-session key
-  continuity or verification (no "this contact's key changed" warnings,
-  because there's no stored prior key to compare against).
+- TOFU is anchored to **display name**, not any stronger identity --
+  there's no login/account system here, so "the name someone typed in" is
+  the only handle available. A newcomer claiming a name you already know
+  looks identical to that contact just changing devices; the warning
+  fires either way, but there's no way to tell which happened from inside
+  the protocol.
 - Each client publishes exactly one Olm one-time key and never rotates
   it. Real X3DH wants one-time keys consumed exactly once; if more than
   one peer establishes a session with a client before it reconnects, that
@@ -188,6 +236,24 @@ Unlike the iOS Simulator (which shares the host Mac's network stack, so
 runs its own virtual network. From inside the emulator, `10.0.2.2` is the
 alias for the host machine's `localhost` — use that instead of
 `127.0.0.1` when pointing the app at a relay server running on your Mac.
+
+### A gotcha specific to Compose: `LocalContext.current` in default parameters
+
+`ConnectClient` needs a `Context` (for `context.filesDir`), and the
+natural-looking `fun MainScreen(client: NetworkClient = remember {
+NetworkClient(LocalContext.current) })` fails to compile: `@Composable
+invocations can only happen from the context of a @Composable function`
+-- default parameter *expressions* aren't evaluated in the composable's
+own call context, even though the function itself is `@Composable`.
+Fix is to take a nullable default and resolve it in the function body
+instead, where `LocalContext.current` is legal:
+```kotlin
+@Composable
+fun MainScreen(client: NetworkClient? = null) {
+    val context = LocalContext.current
+    val client = client ?: remember { NetworkClient(context) }
+    ...
+```
 
 ### A gotcha specific to `adb shell input text`
 
