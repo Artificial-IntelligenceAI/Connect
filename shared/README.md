@@ -21,16 +21,20 @@ A local Swift Package (`ConnectKit/`) with three targets:
   `MessagingCore.ConnectClient` directly, no UI involved. See the root
   [README](../README.md#testing-the-rust-swift-ffi-directly).
 
-## Automated tests (`core/src`)
+## Automated tests
 
-`cargo test -p messaging-core` runs the Rust core's test suite --
+`cargo test --workspace` runs everything below (23 tests as of this
+writing: 17 in `messaging-core`, 6 in `messaging-server`). Two different
+styles are used deliberately, at different layers:
+
+### `core/src` -- fast, no sockets
+
 `core/src/client.rs` and `core/src/persistence.rs` each have a
-`#[cfg(test)] mod tests` at the bottom. Nothing here spins up a real
-server or WebSocket; the crypto/protocol logic is factored into plain
-functions (`handle_new_peer`, `handle_key_exchange`, `decrypt_message`,
-`backoff_delay`, `reset_peer_state`, ...) that take a `SharedCrypto`
-directly, so tests call them the same way `connect()`'s event loop does,
-just without a socket in between. Coverage so far:
+`#[cfg(test)] mod tests` at the bottom testing crypto/protocol logic
+directly: plain functions (`handle_new_peer`, `handle_key_exchange`,
+`decrypt_message`, `backoff_delay`, `reset_peer_state`, ...) that take a
+`SharedCrypto` directly, called the same way `connect()`'s event loop
+does, just without a socket in between. These run in milliseconds.
 
 - **`client.rs`**: a full two-party Olm handshake + bidirectional Megolm
   message roundtrip (`full_handshake_and_message_roundtrip_both_directions`
@@ -38,8 +42,7 @@ just without a socket in between. Coverage so far:
   original E2EE implementation would have broken); all three TOFU
   outcomes (new contact, unchanged key on reconnect, changed key
   warning); `backoff_delay`'s growth/cap; `sleep_or_cancel`'s two exit
-  paths (timer vs. cancellation, via `#[tokio::test]`); `reset_peer_state`
-  clearing peer maps but not identity.
+  paths; `reset_peer_state` clearing peer maps but not identity.
 - **`persistence.rs`**: identity persists across repeated
   `load_or_create_account` calls against the same `data_dir` and differs
   across different dirs; `known_peers.json` round-trips; missing files
@@ -50,16 +53,61 @@ Tests that touch disk use `std::env::temp_dir()` with a `Uuid::new_v4()`
 suffix per test (not a shared fixture directory) so they can run
 concurrently without racing each other.
 
-**Not covered yet**: the actual `tokio_tungstenite` WebSocket loop inside
-`connect()` (the retry/backoff *logic* is tested via `backoff_delay` and
-`sleep_or_cancel` directly, but the surrounding `connect_async`/`select!`
-state machine itself isn't exercised by an automated test) and the
-`server/` crate has no tests of its own yet. `FFISmokeTest` remains the
-way to exercise the real network path end to end (see below and the root
-README) -- these two are complementary, not redundant: unit tests catch
-protocol/crypto logic bugs fast and without a server running, while
-`FFISmokeTest` is what actually proves the wire format, backoff timing,
-and platform FFI bindings work together for real.
+### `core/src/client.rs` -- real sockets, the retry state machine itself
+
+A second group of tests in the same file's `mod tests` binds a real
+`tokio::net::TcpListener` on an ephemeral port and drives
+`ConnectClient::connect` against it with `tokio_tungstenite::accept_async`
+on the other end -- this exercises the actual `connect_async`/
+`tokio::select!` loop inside `connect()`, not just the logic it calls
+out to:
+
+- **`first_attempt_failure_reports_failed_and_does_not_retry`** -- binds
+  a listener to claim a port, then drops it before the client ever
+  connects (deterministic connection-refused), and confirms `Failed`
+  fires once with no retry.
+- **`drop_after_connecting_triggers_reconnect_to_the_same_address`** --
+  accepts a connection, waits for `Connected`, drops the socket with
+  nothing in flight, confirms `Reconnecting { attempt: 1 }` fires, then
+  accepts a second connection on the *same* listener and confirms it
+  reconnects and reports `Connected` again.
+- **`disconnect_actually_stops_the_retry_loop`** -- a regression test
+  for the bug this session found and fixed: `disconnect()` used to only
+  clear the client's own field references, leaving the background retry
+  loop running forever. After a drop puts the client into `Reconnecting`,
+  calling `disconnect()` and then deliberately *not* bringing the fake
+  server back confirms no further state changes occur.
+
+These are real integration tests (real sockets, real backoff delays --
+the suite takes ~3s, not milliseconds), so each wait is wrapped in an
+explicit `tokio::time::timeout` that panics with a clear message rather
+than letting a broken assumption hang the run.
+
+### `server/src/main.rs` -- the relay, end to end
+
+`messaging-server` had no tests before this; `main()` was refactored to
+extract a small `fn app() -> Router` (previously inlined) so tests can
+build the exact same axum app the real binary serves, then bind it to an
+ephemeral port and drive it with real `tokio-tungstenite` clients (a
+`[dev-dependencies]`-only addition -- the server's own handler code still
+only uses axum's built-in `extract::ws` types). One plain unit test
+(`broadcast_except_skips_the_excluded_peer_and_reaches_everyone_else`)
+checks the exclusion logic directly against in-memory channels; the rest
+are full protocol round-trips through real WebSocket connections:
+joining alone gets an empty roster; a second joiner sees the first in
+their roster and the first gets `PeerJoined`; a chat message reaches
+other peers but never echoes back to its sender; a `KeyExchange`
+reaches only its named `to` target, not bystanders; disconnecting
+broadcasts `PeerLeft` to the room. Every `recv()` in these tests is
+timeout-bounded for the same reason as above.
+
+Together, the three layers are complementary, not redundant: the fast
+unit tests catch crypto/protocol logic bugs without any networking
+involved; the socket-level `client.rs` and `server/` tests prove the
+actual retry state machine and wire protocol work over a real
+connection; `FFISmokeTest` (see below and the root README) remains the
+only thing that proves the full stack -- real client, real server, real
+platform FFI bindings -- works together end to end.
 
 ## End-to-end encryption (`core/src/client.rs`)
 

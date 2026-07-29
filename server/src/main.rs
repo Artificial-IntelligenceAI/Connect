@@ -38,21 +38,21 @@ impl AppState {
     }
 }
 
+fn app() -> Router {
+    Router::new()
+        .route("/ws", get(ws_handler))
+        .with_state(AppState::default())
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
-
-    let state = AppState::default();
-
-    let app = Router::new()
-        .route("/ws", get(ws_handler))
-        .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 7878));
     tracing::info!("messaging-server listening on {addr}");
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, app()).await.unwrap();
 }
 
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
@@ -144,5 +144,215 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
     if state.peers.lock().unwrap().remove(&peer_id).is_some() {
         state.broadcast_except(&peer_id, ServerEvent::PeerLeft { peer_id: peer_id.clone() });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+    fn dummy_peer_info(id: &str) -> PeerInfo {
+        PeerInfo {
+            peer_id: id.to_string(),
+            display_name: id.to_string(),
+            identity_key: format!("{id}-identity-key"),
+            one_time_key: format!("{id}-otk"),
+        }
+    }
+
+    #[test]
+    fn broadcast_except_skips_the_excluded_peer_and_reaches_everyone_else() {
+        let state = AppState::default();
+        let (a_tx, mut a_rx) = mpsc::unbounded_channel();
+        let (b_tx, mut b_rx) = mpsc::unbounded_channel();
+        let (c_tx, mut c_rx) = mpsc::unbounded_channel();
+        {
+            let mut peers = state.peers.lock().unwrap();
+            peers.insert("a".into(), PeerHandle { info: dummy_peer_info("a"), sender: a_tx });
+            peers.insert("b".into(), PeerHandle { info: dummy_peer_info("b"), sender: b_tx });
+            peers.insert("c".into(), PeerHandle { info: dummy_peer_info("c"), sender: c_tx });
+        }
+
+        state.broadcast_except(&"b".to_string(), ServerEvent::PeerLeft { peer_id: "someone".into() });
+
+        assert!(a_rx.try_recv().is_ok(), "non-excluded peer a should receive the broadcast");
+        assert!(b_rx.try_recv().is_err(), "the excluded peer b should not receive its own broadcast");
+        assert!(c_rx.try_recv().is_ok(), "non-excluded peer c should receive the broadcast");
+    }
+
+    // -- Real end-to-end WebSocket integration tests ----------------------
+    //
+    // These run the actual axum app against a real TCP listener on an
+    // ephemeral port and drive it with real tokio-tungstenite clients --
+    // exercising the full join/roster/broadcast/key-exchange/disconnect
+    // wire protocol, not just handler logic in isolation.
+
+    type TestWs = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+    async fn spawn_test_server() -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app()).await.unwrap();
+        });
+        port
+    }
+
+    async fn connect(port: u16) -> TestWs {
+        let (ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
+            .await
+            .expect("failed to connect to the test server");
+        ws
+    }
+
+    fn join(display_name: &str) -> ClientEvent {
+        ClientEvent::Join {
+            display_name: display_name.to_string(),
+            identity_key: format!("{display_name}-identity-key"),
+            one_time_key: format!("{display_name}-otk"),
+        }
+    }
+
+    async fn send(ws: &mut TestWs, event: ClientEvent) {
+        let json = serde_json::to_string(&event).unwrap();
+        ws.send(WsMessage::Text(json.into())).await.unwrap();
+    }
+
+    /// Reads the next text frame and decodes it as a `ServerEvent`, bounded
+    /// by a timeout so a wrong-order expectation fails the test instead of
+    /// hanging a stuck run forever.
+    async fn recv(ws: &mut TestWs) -> ServerEvent {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let msg = ws
+                    .next()
+                    .await
+                    .expect("stream ended unexpectedly")
+                    .expect("websocket error");
+                if let WsMessage::Text(text) = msg {
+                    return serde_json::from_str(&text).unwrap();
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for a server event")
+    }
+
+    async fn assert_silent(ws: &mut TestWs, within: Duration) {
+        let result = tokio::time::timeout(within, ws.next()).await;
+        assert!(result.is_err(), "expected no message to arrive, but one did");
+    }
+
+    #[tokio::test]
+    async fn joining_alone_gets_an_empty_roster() {
+        let port = spawn_test_server().await;
+        let mut alice = connect(port).await;
+        send(&mut alice, join("Alice")).await;
+
+        match recv(&mut alice).await {
+            ServerEvent::Roster { peers } => assert!(peers.is_empty()),
+            other => panic!("expected Roster, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn second_joiner_sees_the_first_and_the_first_is_notified() {
+        let port = spawn_test_server().await;
+        let mut alice = connect(port).await;
+        send(&mut alice, join("Alice")).await;
+        recv(&mut alice).await; // her own (empty) roster
+
+        let mut bob = connect(port).await;
+        send(&mut bob, join("Bob")).await;
+        match recv(&mut bob).await {
+            ServerEvent::Roster { peers } => {
+                assert_eq!(peers.len(), 1);
+                assert_eq!(peers[0].display_name, "Alice");
+            }
+            other => panic!("expected Roster, got {other:?}"),
+        }
+
+        match recv(&mut alice).await {
+            ServerEvent::PeerJoined { peer } => assert_eq!(peer.display_name, "Bob"),
+            other => panic!("expected PeerJoined, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn messages_broadcast_to_others_but_not_echoed_back_to_the_sender() {
+        let port = spawn_test_server().await;
+        let mut alice = connect(port).await;
+        send(&mut alice, join("Alice")).await;
+        recv(&mut alice).await; // roster
+
+        let mut bob = connect(port).await;
+        send(&mut bob, join("Bob")).await;
+        recv(&mut bob).await; // roster
+        recv(&mut alice).await; // PeerJoined(bob)
+
+        send(&mut alice, ClientEvent::Message { ciphertext: "cipher-abc".into() }).await;
+
+        match recv(&mut bob).await {
+            ServerEvent::Message { ciphertext, .. } => assert_eq!(ciphertext, "cipher-abc"),
+            other => panic!("expected Message, got {other:?}"),
+        }
+        assert_silent(&mut alice, Duration::from_millis(300)).await;
+    }
+
+    #[tokio::test]
+    async fn key_exchange_is_delivered_only_to_its_named_target() {
+        let port = spawn_test_server().await;
+
+        let mut alice = connect(port).await;
+        send(&mut alice, join("Alice")).await;
+        recv(&mut alice).await; // roster
+
+        let mut bob = connect(port).await;
+        send(&mut bob, join("Bob")).await;
+        let alice_id = match recv(&mut bob).await {
+            ServerEvent::Roster { peers } => peers[0].peer_id.clone(),
+            other => panic!("expected Roster, got {other:?}"),
+        };
+        recv(&mut alice).await; // PeerJoined(bob)
+
+        let mut carol = connect(port).await;
+        send(&mut carol, join("Carol")).await;
+        recv(&mut carol).await; // roster with alice+bob
+        recv(&mut alice).await; // PeerJoined(carol)
+        recv(&mut bob).await; // PeerJoined(carol)
+
+        send(&mut bob, ClientEvent::KeyExchange { to: alice_id, ciphertext: "kex-xyz".into() }).await;
+
+        match recv(&mut alice).await {
+            ServerEvent::KeyExchange { ciphertext, .. } => assert_eq!(ciphertext, "kex-xyz"),
+            other => panic!("expected KeyExchange, got {other:?}"),
+        }
+        assert_silent(&mut carol, Duration::from_millis(300)).await;
+    }
+
+    #[tokio::test]
+    async fn disconnecting_broadcasts_peer_left_to_the_room() {
+        let port = spawn_test_server().await;
+
+        let mut alice = connect(port).await;
+        send(&mut alice, join("Alice")).await;
+        recv(&mut alice).await; // roster
+
+        let mut bob = connect(port).await;
+        send(&mut bob, join("Bob")).await;
+        let alice_id = match recv(&mut bob).await {
+            ServerEvent::Roster { peers } => peers[0].peer_id.clone(),
+            other => panic!("expected Roster, got {other:?}"),
+        };
+        recv(&mut alice).await; // PeerJoined(bob)
+
+        drop(alice); // simulate Alice's connection dropping
+
+        match recv(&mut bob).await {
+            ServerEvent::PeerLeft { peer_id } => assert_eq!(peer_id, alice_id),
+            other => panic!("expected PeerLeft, got {other:?}"),
+        }
     }
 }

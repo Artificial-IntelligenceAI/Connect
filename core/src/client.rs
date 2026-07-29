@@ -790,4 +790,146 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert!(messages[1].text.contains("identity key has changed"));
     }
+
+    // -- WebSocket state machine (connect()'s retry/backoff loop) --------
+    //
+    // These drive `ConnectClient::connect` against a real local TCP
+    // listener instead of a mock, so they exercise the actual
+    // `connect_async`/`tokio::select!` state machine, not just the logic
+    // it calls out to. They're slower and timing-sensitive compared to
+    // the crypto tests above (real sockets, real backoff delays), so each
+    // wait is bounded by an explicit timeout that panics with a clear
+    // message instead of hanging a stuck run indefinitely.
+
+    async fn wait_until(
+        listener: &TestListener,
+        timeout: std::time::Duration,
+        predicate: impl Fn(&Vec<ConnectionState>) -> bool,
+    ) -> Vec<ConnectionState> {
+        tokio::time::timeout(timeout, async {
+            loop {
+                {
+                    let states = listener.states.lock().unwrap();
+                    if predicate(&states) {
+                        return states.clone();
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for the expected connection states")
+    }
+
+    #[tokio::test]
+    async fn first_attempt_failure_reports_failed_and_does_not_retry() {
+        // Bind to get a free ephemeral port, then drop the listener so
+        // nothing is actually listening there -- a deterministic way to
+        // get connection-refused without racing a real server's shutdown.
+        let doomed_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = doomed_listener.local_addr().unwrap().port();
+        drop(doomed_listener);
+
+        let client = ConnectClient::new(temp_data_dir());
+        let test_listener = std::sync::Arc::new(TestListener::default());
+        let dyn_listener: std::sync::Arc<dyn ConnectClientListener> = test_listener.clone();
+        client.connect("127.0.0.1".into(), port, "Nobody".into(), dyn_listener);
+
+        let states = wait_until(&test_listener, std::time::Duration::from_secs(5), |s| {
+            s.iter().any(|state| matches!(state, ConnectionState::Failed { .. }))
+        })
+        .await;
+        assert!(
+            !states.iter().any(|state| matches!(state, ConnectionState::Reconnecting { .. })),
+            "a first-attempt failure should report Failed, not retry: {states:?}"
+        );
+
+        // Confirm it really stopped, rather than being about to retry.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert_eq!(
+            test_listener.states.lock().unwrap().len(),
+            states.len(),
+            "no further state changes should follow a first-attempt Failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn drop_after_connecting_triggers_reconnect_to_the_same_address() {
+        let server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = server.local_addr().unwrap().port();
+
+        let client = ConnectClient::new(temp_data_dir());
+        let test_listener = std::sync::Arc::new(TestListener::default());
+        let dyn_listener: std::sync::Arc<dyn ConnectClientListener> = test_listener.clone();
+        client.connect("127.0.0.1".into(), port, "Reconnector".into(), dyn_listener);
+
+        let (stream, _) = server.accept().await.unwrap();
+        let first_ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+
+        // Don't drop the socket until Connected has actually been
+        // reported, so this exercises "drop after a real connection", not
+        // a race with the initial join handshake.
+        wait_until(&test_listener, std::time::Duration::from_secs(5), |s| {
+            matches!(s.last(), Some(ConnectionState::Connected))
+        })
+        .await;
+
+        drop(first_ws); // the server vanishes with nothing in flight
+
+        wait_until(&test_listener, std::time::Duration::from_secs(5), |s| {
+            s.iter().any(|state| matches!(state, ConnectionState::Reconnecting { attempt: 1 }))
+        })
+        .await;
+
+        // The retry loop should come back to the same host:port.
+        let (stream, _) = server.accept().await.unwrap();
+        let _second_ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+
+        let states = wait_until(&test_listener, std::time::Duration::from_secs(10), |s| {
+            s.iter().filter(|state| matches!(state, ConnectionState::Connected)).count() >= 2
+        })
+        .await;
+        assert!(states.iter().any(|s| matches!(s, ConnectionState::Reconnecting { attempt: 1 })));
+    }
+
+    #[tokio::test]
+    async fn disconnect_actually_stops_the_retry_loop() {
+        // Regression test: `disconnect()` used to only clear the client's
+        // own field references, leaving the spawned retry loop running
+        // forever in the background. If that regresses, this test hangs
+        // waiting for a server that never comes back, rather than passing.
+        let server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = server.local_addr().unwrap().port();
+
+        let client = ConnectClient::new(temp_data_dir());
+        let test_listener = std::sync::Arc::new(TestListener::default());
+        let dyn_listener: std::sync::Arc<dyn ConnectClientListener> = test_listener.clone();
+        client.connect("127.0.0.1".into(), port, "Canceller".into(), dyn_listener);
+
+        let (stream, _) = server.accept().await.unwrap();
+        let ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        wait_until(&test_listener, std::time::Duration::from_secs(5), |s| {
+            matches!(s.last(), Some(ConnectionState::Connected))
+        })
+        .await;
+
+        drop(ws);
+        wait_until(&test_listener, std::time::Duration::from_secs(5), |s| {
+            s.iter().any(|state| matches!(state, ConnectionState::Reconnecting { .. }))
+        })
+        .await;
+
+        client.disconnect();
+        let count_at_disconnect = test_listener.states.lock().unwrap().len();
+
+        // The fake server deliberately never accepts again -- if
+        // cancellation didn't actually take effect, the retry loop would
+        // keep trying (and failing) and this count would grow.
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        assert_eq!(
+            count_at_disconnect,
+            test_listener.states.lock().unwrap().len(),
+            "disconnect() should stop the retry loop, not just clear local references"
+        );
+    }
 }
