@@ -329,6 +329,27 @@ Three small, unrelated fixes landed together in one pass:
   new size -- no Swift equivalent needed, iOS/macOS don't recreate the
   view hierarchy on rotation/resize.
 
+## Android: keyboard was hiding the message list while typing
+
+Real bug, hit and fixed, not theorized: a naive attempt to fix this
+("messages aren't visible while the keyboard is up") by adding
+`Modifier.imePadding()` to `MainScreen`'s root `Column` made it *worse* --
+the message `LazyColumn` collapsed to a completely blank area whenever
+the keyboard was open, while the composer row stayed visible right above
+it. Root cause: the window was *already* being resized for the IME by
+the platform's own default behavior, and `imePadding()` on top of that
+consumed the same inset a second time, squeezing the `weight(1f)`
+`LazyColumn` down to effectively zero height. Fixed by removing that
+`imePadding()` and instead explicitly declaring
+`android:windowSoftInputMode="adjustResize"` on `MainActivity` in the
+manifest, so there's exactly one well-defined resize behavior instead of
+an ambiguous default plus a Compose-side inset on top of it. Verified on
+the real device: a message sent to the conversation stays visible right
+above the composer with the keyboard open, instead of the list going
+blank. `CreateGroupDialog` keeps its own `imePadding()` -- a Compose
+`Dialog` is a separate window not covered by the Activity's
+`windowSoftInputMode`, so it still needs explicit IME handling.
+
 ## Local notifications (`Notifications.kt` / `NetworkClient.swift`)
 
 Background message alerts, added as local-only notifications -- there is

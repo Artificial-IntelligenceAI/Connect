@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
@@ -361,6 +362,7 @@ private fun CreateGroupDialog(
                 .padding(20.dp)
                 .widthIn(min = 300.dp)
                 .dismissKeyboardOnTap()
+                .imePadding()
         ) {
             Text("New group chat", style = MaterialTheme.typography.titleMedium, color = Solarized.base01)
             Spacer(Modifier.height(12.dp))
