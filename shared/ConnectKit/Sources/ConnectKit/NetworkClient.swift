@@ -1,5 +1,36 @@
 import Foundation
 import MessagingCore
+import UserNotifications
+#if os(macOS)
+import AppKit
+#elseif os(iOS)
+import UIKit
+#endif
+
+/// True while this app is the active, frontmost app -- used to suppress
+/// notifications for messages the user is already looking at.
+private func isAppActive() -> Bool {
+    #if os(macOS)
+    return NSApplication.shared.isActive
+    #elseif os(iOS)
+    return UIApplication.shared.applicationState == .active
+    #else
+    return true
+    #endif
+}
+
+/// Local notifications only -- there's no push infrastructure (no APNs
+/// registration, no server-side offline delivery), so these only fire
+/// while this process is still alive in the background. If the OS has
+/// fully terminated the app, nothing will notify you until you reopen it.
+private func notifyNewMessage(conversationKey: String, title: String, body: String) {
+    let content = UNMutableNotificationContent()
+    content.title = title
+    content.body = body
+    content.sound = .default
+    let request = UNNotificationRequest(identifier: conversationKey, content: content, trigger: nil)
+    UNUserNotificationCenter.current().add(request)
+}
 
 enum Conversation: Equatable {
     case system
@@ -42,6 +73,10 @@ final class NetworkClient: ObservableObject {
 
     private let client = MessagingCore.ConnectClient(dataDir: defaultDataDirectory())
     private var listener: Listener?
+
+    init() {
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { _, _ in }
+    }
 
     func connect(host: String, port: Int, displayName: String) {
         guard let portNumber = UInt16(exactly: port) else {
@@ -108,6 +143,20 @@ final class NetworkClient: ObservableObject {
         // every time is cheap.
         knownPeers = client.listKnownPeers()
         groups = client.listGroups()
+
+        // Only notify for actual chat content, and only while the app
+        // isn't already frontmost -- no point interrupting someone already
+        // looking at the conversation.
+        if !isAppActive() {
+            switch conversation {
+            case .system:
+                break
+            case .direct(let peerIdentityKey):
+                notifyNewMessage(conversationKey: "direct:\(peerIdentityKey)", title: message.from, body: message.text)
+            case .group(let groupId, let groupName):
+                notifyNewMessage(conversationKey: "group:\(groupId)", title: groupName, body: "\(message.from): \(message.text)")
+            }
+        }
     }
 }
 

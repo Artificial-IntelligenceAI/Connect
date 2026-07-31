@@ -296,6 +296,99 @@ whole-tree recomposition. Fixed by eagerly calling
 `.background(Solarized.base3)` -- is composed, so the persisted theme is
 already active before the first frame renders anything.
 
+## Small UI/UX fixes (tap-to-dismiss keyboard, sidebar layout, rotation)
+
+Three small, unrelated fixes landed together in one pass:
+
+- **Tap anywhere to dismiss the keyboard.** Neither platform does this by
+  default for a plain text field. Swift: a single `.onTapGesture {
+  dismissKeyboard() }` at the root of `ContentView.body` (after its
+  `.background`, so the gesture's hit-testable area covers the full
+  window) covers the connect screen, chat list, and conversation view in
+  one place; `.scrollDismissesKeyboard(.immediately)` on the message
+  list/search list/peer list catches the areas a `List`'s own row taps
+  would otherwise swallow. The `CreateGroupSheet` modal gets its own tap
+  gesture since a `.sheet` is a separate view hierarchy. Android: a
+  `Modifier.dismissKeyboardOnTap()` helper (`detectTapGestures` calling
+  `LocalFocusManager.clearFocus()` + hiding the IME controller) applied
+  to `MainScreen`'s root `Column` and to `CreateGroupDialog`'s `Column`
+  (a `Dialog` is a separate window, same reasoning as the Swift sheet).
+- **Sidebar buttons centered.** The All/DM/GC filters plus the settings
+  gear used to sit top-aligned with the gear pushed to the very bottom
+  via a greedy `Spacer`. Now a `Spacer` on both ends (Swift) /
+  `verticalArrangement = Arrangement.Center` with no trailing weighted
+  spacer (Android) centers the whole button group together in the middle
+  of the sidebar instead.
+- **Android: rotation no longer disconnects.** By default Android
+  destroys and recreates the entire `Activity` on a configuration change
+  like rotation, which discarded the `NetworkClient` (and its live
+  WebSocket) since it only lived in `remember` state tied to that
+  composition. Fixed with `android:configChanges="orientation|screenSize|
+  screenLayout|keyboardHidden"` on `MainActivity` in the manifest, so
+  Android leaves the Activity alone and Compose just re-lays-out for the
+  new size -- no Swift equivalent needed, iOS/macOS don't recreate the
+  view hierarchy on rotation/resize.
+
+## Local notifications (`Notifications.kt` / `NetworkClient.swift`)
+
+Background message alerts, added as local-only notifications -- there is
+no push infrastructure (no FCM registration, no APNs, no server-side
+offline delivery/mailbox). **A notification only fires while this
+process is still alive in the background.** If the OS has fully
+terminated the app, nothing will notify you until you reopen it; a true
+always-on story would need a foreground service (Android) or a real push
+backend (both platforms) and is deliberately out of scope here.
+
+- **Trigger point**: both platforms already have exactly one place every
+  incoming `ChatMessage` passes through -- `NetworkClient`'s
+  `onMessage`/`handleMessage` callback. A notification fires there when
+  `conversation != .system` (system notices like "X joined" don't
+  warrant an interruption) and the app isn't currently in the
+  foreground/active.
+- **Foreground detection**: Android uses `ProcessLifecycleOwner` (new
+  `AppForegroundTracker` object, installed once in `MainActivity.onCreate`)
+  rather than any single Activity's lifecycle, since it reflects the
+  whole process regardless of Activity recreation. Swift checks
+  `NSApplication.shared.isActive` (macOS) / `UIApplication.shared
+  .applicationState == .active` (iOS) via a small platform-conditional
+  helper, mirroring the `dismissKeyboard()` pattern already used for the
+  keyboard fix above.
+- **Per-conversation coalescing**: both platforms key the notification by
+  a stable per-conversation identifier (`"direct:<peerIdentityKey>"` /
+  `"group:<groupId>"`) -- Android hashes it into the notification ID,
+  Swift uses it as the `UNNotificationRequest` identifier -- so a burst
+  of messages from the same conversation updates one notification
+  instead of piling up separate ones.
+- **Android permission handling**: `POST_NOTIFICATIONS` (required at
+  runtime on API 33+) is requested once from `MainActivity.onCreate` via
+  `ActivityResultContracts.RequestPermission()`; `Notifications.notify`
+  itself also checks `ActivityCompat.checkSelfPermission` before posting
+  and silently no-ops if denied, since `NotificationManagerCompat` can
+  otherwise throw on some OS versions when the permission is missing.
+  Swift requests `UNUserNotificationCenter` authorization once in
+  `NetworkClient.init()`.
+- **`FFISmokeTest` gained the ability to send a DM** (optional 5th/6th
+  args: target display name + text), closing a real, previously-stale
+  gap noted in its own header comment (it used to say there was "no
+  query API yet" for who's online -- untrue since `listKnownPeers()` was
+  added for the chat-list GUI pass). This is what verified the
+  notification path end-to-end without needing risky GUI automation on
+  macOS: a real Android device sent to background, a `FFISmokeTest`
+  instance connects, polls `listKnownPeers()` for the target display
+  name, and sends.
+- **Real bug hit during verification, not theorized**: backgrounding the
+  Android app immediately dropped its WebSocket connection (visible as
+  "Reconnecting... (attempt N)" within seconds of pressing Home) even
+  though the process was still alive -- Android's network-standby/Doze
+  power management can suspend an idle socket for a backgrounded app
+  quickly, well before the OS would actually kill the process. The
+  existing reconnect-with-backoff logic (see "Reconnection handling"
+  below) recovers on its own once conditions allow, and once reconnected
+  the notification path worked correctly end-to-end. Worth knowing if
+  notifications ever seem to silently not arrive on Android: check
+  whether the app is mid-reconnect rather than assuming the notification
+  code itself is broken.
+
 ## Identity persistence and verification (`core/src/persistence.rs`)
 
 `ConnectClient::new(dataDir)` takes a platform-supplied, writable,

@@ -4,19 +4,16 @@
 // exercises the Rust<->Swift boundary directly. Run two instances with
 // different display names to verify they discover each other.
 //
-// Doesn't exercise sending a 1:1/group message: that needs a live peer_id,
-// and there's no query API yet for "who's currently online" over this
-// listener interface (ConnectClientListener only reports ChatMessage/
-// ConnectionState) -- that's part of the deferred chat-list GUI work, not
-// this smoke test. `core/src/client.rs`'s own test suite covers DM/group
-// send+receive directly instead.
+// Optionally sends a DM: if sendToDisplayName/sendToText are given, polls
+// listKnownPeers() for a peer with that display name (via TOFU discovery
+// from its join notice) and sends it a direct message once found.
 //
 // Identity is persisted per dataDirTag (defaults to displayName), under
 // a temp directory -- re-running with the same tag reuses the same
 // identity (test persistence), a different tag gets a fresh one (test
 // the key-changed warning by reusing a displayName with a different tag).
 //
-// Usage: swift run FFISmokeTest [displayName] [host] [port] [dataDirTag]
+// Usage: swift run FFISmokeTest [displayName] [host] [port] [dataDirTag] [sendToDisplayName] [sendToText]
 
 import Foundation
 import MessagingCore
@@ -47,6 +44,8 @@ let displayName = args.count > 1 ? args[1] : "FFISmokeTest"
 let host = args.count > 2 ? args[2] : "127.0.0.1"
 let port = args.count > 3 ? UInt16(args[3]) ?? 7878 : 7878
 let dataDirTag = args.count > 4 ? args[4] : displayName
+let sendToDisplayName = args.count > 5 ? args[5] : nil
+let sendToText = args.count > 6 ? args[6] : nil
 
 let dataDir = FileManager.default.temporaryDirectory
     .appendingPathComponent("ConnectSmokeTest", isDirectory: true)
@@ -64,8 +63,24 @@ if listener.connectedSemaphore.wait(timeout: .now() + 5) == .timedOut {
     exit(1)
 }
 
-// Stay alive so any other instance connecting concurrently shows up as a
-// PeerJoined/TOFU notice above.
-Thread.sleep(forTimeInterval: 4.0)
+if let sendToDisplayName, let sendToText {
+    var target: KnownPeer?
+    for _ in 0..<10 {
+        target = client.listKnownPeers().first { $0.displayName == sendToDisplayName }
+        if target != nil { break }
+        Thread.sleep(forTimeInterval: 0.5)
+    }
+    guard let target else {
+        print("TIMEOUT waiting for peer \"\(sendToDisplayName)\" to be known")
+        exit(1)
+    }
+    print("Sending to \(sendToDisplayName) (\(target.peerId == nil ? "offline" : "online")): \(sendToText)")
+    client.sendDirectMessage(peerIdentityKey: target.identityKey, text: sendToText)
+    Thread.sleep(forTimeInterval: 1.0)
+} else {
+    // Stay alive so any other instance connecting concurrently shows up as
+    // a PeerJoined/TOFU notice above.
+    Thread.sleep(forTimeInterval: 4.0)
+}
 client.disconnect()
 print("done")

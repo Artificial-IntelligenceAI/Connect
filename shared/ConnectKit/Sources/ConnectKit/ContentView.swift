@@ -1,5 +1,19 @@
 import SwiftUI
 import MessagingCore
+#if os(macOS)
+import AppKit
+#endif
+
+/// Resigns whichever text field currently has focus. Used to let a tap
+/// anywhere outside a field dismiss the keyboard, since neither platform
+/// does this by default for a plain `TextField`.
+private func dismissKeyboard() {
+    #if os(iOS)
+    UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+    #elseif os(macOS)
+    NSApp.keyWindow?.makeFirstResponder(nil)
+    #endif
+}
 
 enum ChatFilter: CaseIterable, Hashable {
     case all, direct, group
@@ -64,6 +78,7 @@ public struct ContentView: View {
         .frame(minWidth: 420, minHeight: 500)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Solarized.base3)
+        .onTapGesture { dismissKeyboard() }
         .preferredColorScheme(settings.theme == .solarizedDark ? .dark : .light)
     }
 
@@ -118,6 +133,7 @@ public struct ContentView: View {
 
     private var filterSidebar: some View {
         VStack(spacing: 8) {
+            Spacer()
             ForEach(ChatFilter.allCases, id: \.self) { option in
                 Button(option.label) { filter = option }
                     .buttonStyle(.plain)
@@ -127,7 +143,6 @@ public struct ContentView: View {
                     .foregroundStyle(filter == option ? Solarized.blue : Solarized.base01)
                     .clipShape(RoundedRectangle(cornerRadius: 6))
             }
-            Spacer()
             Button {
                 showingSettings = true
             } label: {
@@ -135,6 +150,7 @@ public struct ContentView: View {
             }
             .buttonStyle(.plain)
             .foregroundStyle(Solarized.base01)
+            Spacer()
         }
         .padding(8)
         .frame(width: 72)
@@ -179,6 +195,7 @@ public struct ContentView: View {
                     .padding(.top, 6)
                 }
                 .frame(maxHeight: 80)
+                .scrollDismissesKeyboard(.immediately)
             }
         }
     }
@@ -226,6 +243,7 @@ public struct ContentView: View {
         }
         .listStyle(.plain)
         .background(Solarized.base3)
+        .scrollDismissesKeyboard(.immediately)
         .overlay {
             if conversationEntries.isEmpty {
                 Text(searchText.isEmpty ? "No conversations yet" : "No matches")
@@ -282,6 +300,7 @@ public struct ContentView: View {
                     .padding()
                 }
                 .background(Solarized.base3)
+                .scrollDismissesKeyboard(.immediately)
                 .onChange(of: client.messages.count) { _ in
                     if let last = messages(for: selected).last {
                         proxy.scrollTo(last.id, anchor: .bottom)
@@ -441,6 +460,7 @@ private struct CreateGroupSheet: View {
             }
             .listStyle(.plain)
             .frame(minHeight: 120)
+            .scrollDismissesKeyboard(.immediately)
 
             HStack {
                 Button("Cancel", action: onCancel)
@@ -455,5 +475,6 @@ private struct CreateGroupSheet: View {
         .padding(20)
         .frame(width: 340, height: 380)
         .background(Solarized.base3)
+        .onTapGesture { dismissKeyboard() }
     }
 }

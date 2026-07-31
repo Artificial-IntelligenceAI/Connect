@@ -2,6 +2,7 @@ package com.messagingapp.connect.ui
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -43,7 +44,10 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
@@ -71,6 +75,21 @@ private data class ConversationEntry(
     val target: SelectedConversation
 )
 
+/// Lets a tap anywhere outside a focused field dismiss the keyboard --
+/// Compose has no built-in "tap elsewhere to dismiss" behavior, unlike a
+/// plain scroll gesture inside a text field's own container.
+@Composable
+private fun Modifier.dismissKeyboardOnTap(): Modifier {
+    val focusManager = LocalFocusManager.current
+    val keyboardController = LocalSoftwareKeyboardController.current
+    return this.pointerInput(Unit) {
+        detectTapGestures(onTap = {
+            focusManager.clearFocus()
+            keyboardController?.hide()
+        })
+    }
+}
+
 @Composable
 fun MainScreen(client: NetworkClient? = null) {
     val context = LocalContext.current
@@ -86,7 +105,8 @@ fun MainScreen(client: NetworkClient? = null) {
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .background(Solarized.base3),
+            .background(Solarized.base3)
+            .dismissKeyboardOnTap(),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
         when (client.state) {
@@ -259,7 +279,8 @@ private fun FilterSidebar(selected: ChatFilter, onSelect: (ChatFilter) -> Unit, 
             .width(72.dp)
             .fillMaxSize()
             .background(Solarized.base2)
-            .padding(8.dp)
+            .padding(8.dp),
+        verticalArrangement = Arrangement.Center
     ) {
         for (option in ChatFilter.values()) {
             val isSelected = option == selected
@@ -276,8 +297,6 @@ private fun FilterSidebar(selected: ChatFilter, onSelect: (ChatFilter) -> Unit, 
             )
             Spacer(Modifier.height(8.dp))
         }
-
-        Spacer(Modifier.weight(1f))
 
         Text(
             "⚙",
@@ -341,6 +360,7 @@ private fun CreateGroupDialog(
                 .background(Solarized.base3, RoundedCornerShape(8.dp))
                 .padding(20.dp)
                 .widthIn(min = 300.dp)
+                .dismissKeyboardOnTap()
         ) {
             Text("New group chat", style = MaterialTheme.typography.titleMedium, color = Solarized.base01)
             Spacer(Modifier.height(12.dp))

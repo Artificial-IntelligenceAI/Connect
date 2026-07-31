@@ -50,6 +50,7 @@ class NetworkClient(context: Context) {
     private val client = ConnectClient(context.filesDir.absolutePath)
     private val mainHandler = Handler(Looper.getMainLooper())
     private var nextMessageId = 0L
+    private val appContext = context.applicationContext
 
     fun connect(host: String, port: Int, displayName: String) {
         if (port !in 0..65535) {
@@ -110,6 +111,21 @@ class NetworkClient(context: Context) {
                 // are small enough that refreshing every time is cheap.
                 knownPeers = client.listKnownPeers()
                 groups = client.listGroups()
+
+                // Only notify for actual chat content, and only while the
+                // app is backgrounded -- no point interrupting someone
+                // already looking at the conversation.
+                if (!AppForegroundTracker.isForeground) {
+                    when (conversation) {
+                        is Conversation.Direct -> Notifications.notify(
+                            appContext, "direct:${conversation.peerIdentityKey}", message.from, message.text
+                        )
+                        is Conversation.Group -> Notifications.notify(
+                            appContext, "group:${conversation.groupId}", conversation.groupName, "${message.from}: ${message.text}"
+                        )
+                        Conversation.System -> {}
+                    }
+                }
             }
         }
     }
