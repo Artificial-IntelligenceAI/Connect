@@ -10,7 +10,7 @@ use axum::{
     Router,
 };
 use futures_util::{SinkExt, StreamExt};
-use messaging_core::{ClientEvent, PeerId, PeerInfo, ServerEvent};
+use messaging_core::{ClientEvent, GroupId, PeerId, PeerInfo, ServerEvent};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -19,9 +19,23 @@ struct PeerHandle {
     sender: mpsc::UnboundedSender<ServerEvent>,
 }
 
+/// A `GroupInvite` addressed to an identity that wasn't reachable when it
+/// was sent -- held until that identity's owner next joins. Lives only in
+/// memory for this server process's lifetime: like everything else here,
+/// restarting the relay drops anything still pending, the same as it drops
+/// every other bit of state.
+struct PendingInvite {
+    from_identity_key: String,
+    group_id: GroupId,
+    ciphertext: String,
+}
+
 #[derive(Clone, Default)]
 struct AppState {
     peers: Arc<Mutex<HashMap<PeerId, PeerHandle>>>,
+    /// to_identity_key -> queued invites, delivered the moment that
+    /// identity's owner sends `Join`.
+    pending_invites: Arc<Mutex<HashMap<String, Vec<PendingInvite>>>>,
 }
 
 impl AppState {
@@ -43,6 +57,18 @@ impl AppState {
         if let Some(peer) = self.peers.lock().unwrap().get(to) {
             let _ = peer.sender.send(event);
         }
+    }
+
+    /// Find the live peer_id currently registered for `identity_key`, if
+    /// any -- a linear scan, which is fine at this app's expected
+    /// (LAN-party-sized) peer counts.
+    fn peer_id_for_identity(&self, identity_key: &str) -> Option<PeerId> {
+        self.peers
+            .lock()
+            .unwrap()
+            .values()
+            .find(|p| p.info.identity_key == identity_key)
+            .map(|p| p.info.peer_id.clone())
     }
 }
 
@@ -121,7 +147,19 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         },
                     );
 
+                    let pending = state2.pending_invites.lock().unwrap().remove(&info.identity_key);
+
                     state2.broadcast_except(&peer_id2, ServerEvent::PeerJoined { peer: info });
+
+                    if let Some(pending) = pending {
+                        for invite in pending {
+                            let _ = tx2.send(ServerEvent::InviteToGroup {
+                                from_identity_key: invite.from_identity_key,
+                                group_id: invite.group_id,
+                                ciphertext: invite.ciphertext,
+                            });
+                        }
+                    }
                 }
                 ClientEvent::DirectMessage { to, ciphertext } => {
                     state2.send_to(
@@ -140,6 +178,25 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         &to,
                         ServerEvent::GroupMessage { from: peer_id2.clone(), group_id, ciphertext },
                     );
+                }
+                ClientEvent::InviteToGroup { to_identity_key, group_id, ciphertext } => {
+                    let from_identity_key = state2
+                        .peers
+                        .lock()
+                        .unwrap()
+                        .get(&peer_id2)
+                        .map(|p| p.info.identity_key.clone());
+                    let Some(from_identity_key) = from_identity_key else { continue };
+
+                    match state2.peer_id_for_identity(&to_identity_key) {
+                        Some(to_peer_id) => state2.send_to(
+                            &to_peer_id,
+                            ServerEvent::InviteToGroup { from_identity_key, group_id, ciphertext },
+                        ),
+                        None => state2.pending_invites.lock().unwrap().entry(to_identity_key).or_default().push(
+                            PendingInvite { from_identity_key, group_id, ciphertext },
+                        ),
+                    }
                 }
             }
         }
@@ -371,6 +428,82 @@ mod tests {
         }
         assert_silent(&mut carol, Duration::from_millis(300)).await;
         assert_silent(&mut bob, Duration::from_millis(300)).await; // no echo to the sender
+    }
+
+    #[tokio::test]
+    async fn invite_to_group_delivers_immediately_when_the_target_is_online() {
+        let port = spawn_test_server().await;
+
+        let mut alice = connect(port).await;
+        send(&mut alice, join("Alice")).await;
+        recv(&mut alice).await; // roster
+
+        let mut bob = connect(port).await;
+        send(&mut bob, join("Bob")).await;
+        recv(&mut bob).await; // roster
+        recv(&mut alice).await; // PeerJoined(bob)
+
+        send(
+            &mut alice,
+            ClientEvent::InviteToGroup {
+                to_identity_key: "Bob-identity-key".into(),
+                group_id: "group-1".into(),
+                ciphertext: "invite-xyz".into(),
+            },
+        )
+        .await;
+
+        match recv(&mut bob).await {
+            ServerEvent::InviteToGroup { from_identity_key, group_id, ciphertext } => {
+                assert_eq!(from_identity_key, "Alice-identity-key");
+                assert_eq!(group_id, "group-1");
+                assert_eq!(ciphertext, "invite-xyz");
+            }
+            other => panic!("expected InviteToGroup, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn invite_to_group_is_held_and_delivered_once_the_offline_target_joins() {
+        let port = spawn_test_server().await;
+
+        let mut alice = connect(port).await;
+        send(&mut alice, join("Alice")).await;
+        recv(&mut alice).await; // roster
+
+        // Bob is not connected at all yet -- Alice invites him anyway.
+        send(
+            &mut alice,
+            ClientEvent::InviteToGroup {
+                to_identity_key: "Bob-identity-key".into(),
+                group_id: "group-1".into(),
+                ciphertext: "invite-xyz".into(),
+            },
+        )
+        .await;
+
+        let mut bob = connect(port).await;
+        send(&mut bob, join("Bob")).await;
+        recv(&mut bob).await; // roster (empty for Bob, but arrives first)
+
+        match recv(&mut bob).await {
+            ServerEvent::InviteToGroup { from_identity_key, group_id, ciphertext } => {
+                assert_eq!(from_identity_key, "Alice-identity-key");
+                assert_eq!(group_id, "group-1");
+                assert_eq!(ciphertext, "invite-xyz");
+            }
+            other => panic!("expected InviteToGroup, got {other:?}"),
+        }
+
+        // Delivered exactly once -- a second, unrelated joiner shouldn't
+        // also receive Bob's already-flushed invite.
+        let mut carol = connect(port).await;
+        send(&mut carol, join("Carol")).await;
+        recv(&mut carol).await; // roster
+        recv(&mut alice).await; // PeerJoined(bob)
+        recv(&mut alice).await; // PeerJoined(carol)
+        recv(&mut bob).await; // PeerJoined(carol)
+        assert_silent(&mut carol, Duration::from_millis(300)).await;
     }
 
     #[tokio::test]

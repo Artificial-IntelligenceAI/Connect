@@ -52,6 +52,7 @@ import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
+import uniffi.messaging_core.GroupSummary
 import uniffi.messaging_core.KnownPeer
 
 enum class ChatFilter(val label: String) {
@@ -192,9 +193,15 @@ private fun ChatListScreen(client: NetworkClient, onOpen: (SelectedConversation)
     var searchText by remember { mutableStateOf("") }
     var showingCreateGroup by remember { mutableStateOf(false) }
     var showingSettings by remember { mutableStateOf(false) }
+    var showingInvites by remember { mutableStateOf(false) }
 
     Row(modifier = Modifier.fillMaxSize()) {
-        FilterSidebar(filter, onSelect = { filter = it }, onSettingsClick = { showingSettings = true })
+        FilterSidebar(
+            filter,
+            onSelect = { filter = it },
+            onInvitesClick = { showingInvites = true },
+            onSettingsClick = { showingSettings = true }
+        )
 
         Column(modifier = Modifier.weight(1f)) {
             if (client.state is ConnectionState.Reconnecting) {
@@ -271,10 +278,19 @@ private fun ChatListScreen(client: NetworkClient, onOpen: (SelectedConversation)
     if (showingSettings) {
         SettingsDialog(onDismiss = { showingSettings = false })
     }
+
+    if (showingInvites) {
+        InvitesDialog(client = client, onDismiss = { showingInvites = false })
+    }
 }
 
 @Composable
-private fun FilterSidebar(selected: ChatFilter, onSelect: (ChatFilter) -> Unit, onSettingsClick: () -> Unit) {
+private fun FilterSidebar(
+    selected: ChatFilter,
+    onSelect: (ChatFilter) -> Unit,
+    onInvitesClick: () -> Unit,
+    onSettingsClick: () -> Unit
+) {
     Column(
         modifier = Modifier
             .width(72.dp)
@@ -299,6 +315,16 @@ private fun FilterSidebar(selected: ChatFilter, onSelect: (ChatFilter) -> Unit, 
             Spacer(Modifier.height(8.dp))
         }
 
+        Text(
+            "✉",
+            color = Solarized.base01,
+            style = MaterialTheme.typography.titleLarge,
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable { onInvitesClick() }
+                .padding(vertical = 10.dp),
+            textAlign = androidx.compose.ui.text.style.TextAlign.Center
+        )
         Text(
             "⚙",
             color = Solarized.base01,
@@ -407,6 +433,111 @@ private fun CreateGroupDialog(
                     colors = ButtonDefaults.buttonColors(containerColor = Solarized.blue)
                 ) {
                     Text("Create")
+                }
+            }
+        }
+    }
+}
+
+/** Invite an existing group's new member -- online *or* offline, unlike
+ * [CreateGroupDialog] above, which only ever offers currently-online peers
+ * at creation time. Pick a group, then pick any known peer not already in
+ * it; the invite is sent via [NetworkClient.inviteToGroup], which the
+ * relay server delivers right away if they're online or holds until they
+ * next join if they're not. */
+@Composable
+private fun InvitesDialog(client: NetworkClient, onDismiss: () -> Unit) {
+    var selectedGroup by remember { mutableStateOf<GroupSummary?>(null) }
+
+    Dialog(onDismissRequest = onDismiss) {
+        Column(
+            modifier = Modifier
+                .background(Solarized.base3, RoundedCornerShape(8.dp))
+                .widthIn(min = 300.dp)
+                .heightIn(min = 200.dp, max = 380.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth().background(Solarized.base2).padding(12.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                val group = selectedGroup
+                if (group != null) {
+                    TextButton(onClick = { selectedGroup = null }) { Text("← Back", color = Solarized.blue) }
+                    Spacer(Modifier.weight(1f))
+                    Text(group.name, color = Solarized.base01, style = MaterialTheme.typography.titleMedium)
+                    Spacer(Modifier.weight(1f))
+                    Spacer(Modifier.width(56.dp))
+                } else {
+                    Text("Invite to a Group", color = Solarized.base01, style = MaterialTheme.typography.titleMedium)
+                }
+            }
+
+            val group = selectedGroup
+            if (group == null) {
+                if (client.groups.isEmpty()) {
+                    Box(modifier = Modifier.fillMaxWidth().weight(1f).padding(24.dp), contentAlignment = Alignment.Center) {
+                        Text(
+                            "No groups yet -- create one first with the + button.",
+                            color = Solarized.base1,
+                            style = MaterialTheme.typography.bodySmall,
+                            textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                        )
+                    }
+                } else {
+                    LazyColumn(modifier = Modifier.fillMaxWidth().weight(1f)) {
+                        items(client.groups) { g ->
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable { selectedGroup = g }
+                                    .padding(horizontal = 16.dp, vertical = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(g.name, color = Solarized.base01)
+                                Spacer(Modifier.weight(1f))
+                                Text(
+                                    "${g.memberCount} member" + if (g.memberCount == 1u) "" else "s",
+                                    color = Solarized.base1,
+                                    style = MaterialTheme.typography.bodySmall
+                                )
+                            }
+                            HorizontalDivider(color = Solarized.base2)
+                        }
+                    }
+                }
+            } else {
+                val currentMembers = remember(group.groupId, client.groups) { client.groupMembers(group.groupId).toSet() }
+                val invitablePeers = client.knownPeers.filter { it.identityKey !in currentMembers }
+                if (invitablePeers.isEmpty()) {
+                    Box(modifier = Modifier.fillMaxWidth().weight(1f).padding(24.dp), contentAlignment = Alignment.Center) {
+                        Text(
+                            "Everyone you know is already in this group.",
+                            color = Solarized.base1,
+                            style = MaterialTheme.typography.bodySmall,
+                            textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                        )
+                    }
+                } else {
+                    LazyColumn(modifier = Modifier.fillMaxWidth().weight(1f)) {
+                        items(invitablePeers) { peer ->
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable { client.inviteToGroup(group.groupId, peer.identityKey) }
+                                    .padding(horizontal = 16.dp, vertical = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(peer.displayName, color = Solarized.base01)
+                                Spacer(Modifier.weight(1f))
+                                Text(
+                                    if (peer.peerId != null) "online" else "offline",
+                                    color = Solarized.base1,
+                                    style = MaterialTheme.typography.bodySmall
+                                )
+                            }
+                            HorizontalDivider(color = Solarized.base2)
+                        }
+                    }
                 }
             }
         }

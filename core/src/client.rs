@@ -50,19 +50,20 @@ async fn sleep_or_cancel(cancel: &mut tokio::sync::watch::Receiver<bool>, dur: s
     }
 }
 
-/// Forget everything learned about peers in the previous connection. Called
-/// at the start of every (re)connect attempt after the first: the server
-/// assigns a fresh peer_id per connection, so old sessions/mappings are
-/// keyed by peer_ids nobody will send again, and the fresh `Roster` the
-/// server sends right after we (re)join will repopulate this from scratch
-/// anyway. Our own identity (`account`) and persisted group metadata are
-/// untouched -- groups are keyed by stable identity, not by peer_id.
+/// Forget everything about the previous connection's *ephemeral* peer_ids.
+/// Called at the start of every (re)connect attempt after the first: the
+/// server assigns a fresh peer_id per connection, so old peer_id-keyed
+/// mappings point nowhere useful, and the fresh `Roster` the server sends
+/// right after we (re)join will repopulate them from scratch anyway. Our
+/// own identity (`account`), persisted group metadata, and -- notably --
+/// the Olm sessions themselves are untouched: sessions are keyed by stable
+/// identity key (see `CryptoState`'s doc comment), not by peer_id, so they
+/// survive a reconnect intact instead of forcing every conversation to
+/// silently re-handshake from scratch.
 fn reset_peer_state(state: &mut CryptoState) {
     state.peer_identity_keys.clear();
     state.peer_display_names.clear();
     state.peer_id_by_identity.clear();
-    state.outbound_olm_sessions.clear();
-    state.inbound_olm_sessions.clear();
 }
 
 /// Which conversation a `ChatMessage` belongs to. `System` covers
@@ -143,17 +144,15 @@ pub trait ConnectClientListener: Send + Sync {
 /// single Olm one-time key, reused across every peer who discovers us this
 /// connection, not consumed once each per textbook X3DH; TOFU is anchored
 /// to display name, so a peer impersonating an existing name from a fresh
-/// identity looks identical to that peer just changing devices; per-peer
-/// Olm sessions (used for DMs and group messages alike) are cleared by
-/// `reset_peer_state` on every reconnect, so a dropped connection
-/// mid-conversation means the session re-bootstraps from scratch next time
-/// either side sends something, and anything sent in that exact window can
-/// be silently dropped; group membership is fixed at creation from
-/// currently-online peers only, no inviting someone offline or adding a
-/// member later; a DM or group chat only works between peers connected to
-/// the same relay server at the same time. Message history isn't
-/// available to late joiners either (true even before E2EE existed: the
-/// server never stored anything).
+/// identity looks identical to that peer just changing devices; Olm
+/// sessions live only in memory (keyed by identity, so they survive a
+/// reconnect, but not a full app restart -- there's no session
+/// persistence to disk, only the long-term `Account`); a DM or group chat
+/// only works between peers who have discovered each other through the
+/// same relay server at some point (not necessarily *right now* -- see
+/// `invite_to_group` for the one place that's no longer a hard
+/// requirement). Message history isn't available to late joiners either
+/// (true even before E2EE existed: the server never stored anything).
 struct CryptoState {
     account: Account,
     display_name: String,
@@ -165,22 +164,31 @@ struct CryptoState {
     /// base64 identity key -> current live peer_id, so a DM/group send can
     /// resolve a stable member identity to whichever connection they're
     /// using right now. Rebuilt from scratch on every (re)connect, same as
-    /// the peer-keyed maps below.
+    /// the peer-id-keyed maps above.
     peer_id_by_identity: HashMap<String, PeerId>,
-    // Deliberately two separate maps, not one keyed by peer_id: the Olm
+    // Deliberately two separate maps, not one keyed by identity: the Olm
     // session we create to *send* a peer something is a different object
     // from the one we create to *decrypt* what they send us, even though
     // both are "with" the same peer. Collapsing them into one map means
     // decrypt ends up using the wrong session and silently fails. Used for
     // everything Olm-encrypted -- 1:1 messages, group invites, and group
-    // messages all reuse these same per-peer sessions.
-    outbound_olm_sessions: HashMap<PeerId, vodozemac::olm::Session>,
-    inbound_olm_sessions: HashMap<PeerId, vodozemac::olm::Session>,
+    // messages all reuse these same per-identity sessions.
+    //
+    // Keyed by base64 identity key, not `PeerId`: a `PeerId` is only valid
+    // for the lifetime of one connection (the server hands out a fresh one
+    // every time), but an Olm session is fundamentally tied to an
+    // *identity*, not a connection. Keying by identity means a session
+    // survives our own reconnects (see `reset_peer_state`) *and* the
+    // other party's -- load-bearing for `invite_to_group`, which needs to
+    // be able to encrypt something for a peer who isn't even online right
+    // now.
+    outbound_olm_sessions: HashMap<String, vodozemac::olm::Session>,
+    inbound_olm_sessions: HashMap<String, vodozemac::olm::Session>,
     /// group_id -> {name, members}, loaded from groups.json at connect()
-    /// and updated whenever we create a group or receive an invite to one.
-    /// No crypto session state lives here -- group messages are just
-    /// pairwise Olm messages fanned out to each member, see
-    /// `send_group_message`.
+    /// and updated whenever we create a group, invite someone to one, or
+    /// receive an invite to one. No crypto session state lives here --
+    /// group messages are just pairwise Olm messages fanned out to each
+    /// member, see `send_group_message`.
     groups: HashMap<GroupId, persistence::GroupMetadata>,
 }
 
@@ -388,8 +396,20 @@ impl ConnectClient {
                                 }
                             }
                             ServerEvent::GroupInvite { from, group_id, ciphertext } => {
+                                let from_identity_key = identity_key_for_peer(&recv_crypto, &from);
+                                if let Some(group_name) = from_identity_key
+                                    .and_then(|k| handle_group_invite(&recv_crypto, &k, &group_id, &ciphertext))
+                                {
+                                    recv_listener.on_message(ChatMessage {
+                                        from: String::new(),
+                                        text: format!("Added to group \"{group_name}\""),
+                                        conversation: Conversation::System,
+                                    });
+                                }
+                            }
+                            ServerEvent::InviteToGroup { from_identity_key, group_id, ciphertext } => {
                                 if let Some(group_name) =
-                                    handle_group_invite(&recv_crypto, &from, &group_id, &ciphertext)
+                                    handle_group_invite(&recv_crypto, &from_identity_key, &group_id, &ciphertext)
                                 {
                                     recv_listener.on_message(ChatMessage {
                                         from: String::new(),
@@ -475,7 +495,7 @@ impl ConnectClient {
         if let Some(peer_id) = &peer_id {
             let ciphertext = {
                 let mut state = crypto.lock().unwrap();
-                state.outbound_olm_sessions.get_mut(peer_id).and_then(|session| {
+                state.outbound_olm_sessions.get_mut(&peer_identity_key).and_then(|session| {
                     let olm_message = session.encrypt(text.as_bytes()).ok()?;
                     serde_json::to_string(&olm_message).ok()
                 })
@@ -537,7 +557,10 @@ impl ConnectClient {
             if let Some(tx) = self.outgoing.lock().unwrap().as_ref() {
                 let mut state = crypto.lock().unwrap();
                 for peer_id in &member_peer_ids {
-                    let Some(session) = state.outbound_olm_sessions.get_mut(peer_id) else { continue };
+                    let Some(identity_key) = state.peer_identity_keys.get(peer_id).map(|k| k.to_base64()) else {
+                        continue;
+                    };
+                    let Some(session) = state.outbound_olm_sessions.get_mut(&identity_key) else { continue };
                     let Ok(olm_message) = session.encrypt(payload_json.as_bytes()) else { continue };
                     let Ok(ciphertext) = serde_json::to_string(&olm_message) else { continue };
                     let _ = tx.send(ClientEvent::GroupInvite {
@@ -564,18 +587,23 @@ impl ConnectClient {
             let Some(group) = state.groups.get(&group_id) else {
                 return;
             };
-            let targets: Vec<PeerId> = group
+            // (peer_id to address the wire message to, identity_key to look
+            // up the right Olm session) for every member currently online.
+            let targets: Vec<(PeerId, String)> = group
                 .members
                 .iter()
-                .filter_map(|m| state.peer_id_by_identity.get(&m.identity_key).cloned())
+                .filter_map(|m| {
+                    let peer_id = state.peer_id_by_identity.get(&m.identity_key)?.clone();
+                    Some((peer_id, m.identity_key.clone()))
+                })
                 .collect();
             (targets, group.name.clone(), state.display_name.clone())
         };
 
         if let Some(tx) = self.outgoing.lock().unwrap().as_ref() {
             let mut state = crypto.lock().unwrap();
-            for peer_id in &targets {
-                let Some(session) = state.outbound_olm_sessions.get_mut(peer_id) else { continue };
+            for (peer_id, identity_key) in &targets {
+                let Some(session) = state.outbound_olm_sessions.get_mut(identity_key) else { continue };
                 let Ok(olm_message) = session.encrypt(text.as_bytes()) else { continue };
                 let Ok(ciphertext) = serde_json::to_string(&olm_message) else { continue };
                 let _ = tx.send(ClientEvent::GroupMessage {
@@ -593,6 +621,113 @@ impl ConnectClient {
                 conversation: Conversation::Group { group_id, group_name },
             });
         }
+    }
+
+    /// Invite `peer_identity_key` -- any known peer, online or offline --
+    /// to an existing group, updating its persisted membership and sending
+    /// the invite via `ClientEvent::InviteToGroup`. Unlike `create_group`'s
+    /// invite step, this doesn't need a live peer_id: the server delivers
+    /// it immediately if they're online, or holds it until they next join
+    /// otherwise (see `server/src/main.rs`'s pending-invite mailbox).
+    ///
+    /// Requires an existing outbound Olm session with that identity --
+    /// i.e. they must already be a "known peer" (`list_known_peers()`),
+    /// someone this client has discovered through the relay at some point.
+    /// Returns `false` if the group doesn't exist, they're already a
+    /// member, we don't recognize the identity, or we're not connected.
+    pub fn invite_to_group(&self, group_id: String, peer_identity_key: String) -> bool {
+        let Some(crypto) = self.crypto.lock().unwrap().clone() else {
+            return false;
+        };
+
+        let Some(display_name) = crypto
+            .lock()
+            .unwrap()
+            .known_peer_keys
+            .iter()
+            .find(|(_, identity)| **identity == peer_identity_key)
+            .map(|(name, _)| name.clone())
+        else {
+            return false;
+        };
+
+        // Build the *updated* member list -- including the new invitee --
+        // up front, so the payload they receive actually tells them
+        // they're in the group, not just who was there before them.
+        let (payload_json, group_name, updated_members) = {
+            let state = crypto.lock().unwrap();
+            let Some(group) = state.groups.get(&group_id) else {
+                return false;
+            };
+            if group.members.iter().any(|m| m.identity_key == peer_identity_key) {
+                return false;
+            }
+            let mut updated_members = group.members.clone();
+            updated_members.push(persistence::GroupMember {
+                identity_key: peer_identity_key.clone(),
+                display_name: display_name.clone(),
+            });
+            let payload = GroupInvitePayload { name: group.name.clone(), members: updated_members.clone() };
+            let Ok(payload_json) = serde_json::to_string(&payload) else {
+                return false;
+            };
+            (payload_json, group.name.clone(), updated_members)
+        };
+
+        let ciphertext = {
+            let mut state = crypto.lock().unwrap();
+            state.outbound_olm_sessions.get_mut(&peer_identity_key).and_then(|session| {
+                let olm_message = session.encrypt(payload_json.as_bytes()).ok()?;
+                serde_json::to_string(&olm_message).ok()
+            })
+        };
+        let Some(ciphertext) = ciphertext else {
+            return false;
+        };
+
+        let data_dir = {
+            let mut state = crypto.lock().unwrap();
+            if let Some(group) = state.groups.get_mut(&group_id) {
+                group.members = updated_members;
+            }
+            state.data_dir.clone()
+        };
+        persistence::save_groups(&data_dir, &crypto.lock().unwrap().groups.clone());
+
+        if let Some(tx) = self.outgoing.lock().unwrap().as_ref() {
+            let _ = tx.send(ClientEvent::InviteToGroup {
+                to_identity_key: peer_identity_key,
+                group_id,
+                ciphertext,
+            });
+        }
+
+        if let Some(listener) = self.listener.lock().unwrap().as_ref() {
+            listener.on_message(ChatMessage {
+                from: String::new(),
+                text: format!("Invited {display_name} to \"{group_name}\""),
+                conversation: Conversation::System,
+            });
+        }
+        true
+    }
+
+    /// Identity keys of `group_id`'s current members, for filtering an
+    /// "invite someone" list down to people who aren't already in it.
+    /// Empty if the group is unknown or we're not connected. Note this
+    /// never includes the local user's own identity key -- membership
+    /// lists only ever record *other* members, the same way
+    /// `create_group`'s `member_peer_ids` never includes the creator.
+    pub fn list_group_members(&self, group_id: String) -> Vec<String> {
+        let Some(crypto) = self.crypto.lock().unwrap().clone() else {
+            return Vec::new();
+        };
+        let state = crypto.lock().unwrap();
+        state
+            .groups
+            .get(&group_id)
+            .map(|group| group.members.iter().map(|m| m.identity_key.clone()).collect())
+            .unwrap_or_default()
     }
 
     /// Every peer this client has ever discovered (persisted TOFU contacts,
@@ -713,7 +848,14 @@ fn handle_new_peer(
     }
 
     let mut state = crypto.lock().unwrap();
-    if state.outbound_olm_sessions.contains_key(&peer.peer_id) {
+    // If we already have an outbound session with this identity -- from
+    // earlier in this same connection, or preserved across a reconnect --
+    // keep using it rather than starting a fresh one. A new session would
+    // still work, but it'd needlessly reset the ratchet and, since the
+    // identity's one-time key is reused per-connection rather than
+    // consumed once (see the v1-limitations doc comment above), there's no
+    // freshness to gain from redoing it.
+    if state.outbound_olm_sessions.contains_key(&peer.identity_key) {
         return;
     }
     let Ok(session) =
@@ -723,46 +865,58 @@ fn handle_new_peer(
     else {
         return;
     };
-    state.outbound_olm_sessions.insert(peer.peer_id.clone(), session);
+    state.outbound_olm_sessions.insert(peer.identity_key.clone(), session);
 }
 
-/// Decrypt an Olm-encrypted payload from `from`, creating an inbound
-/// session first if this is the first message we've ever received from
-/// them (a PreKeyMessage). Shared by direct messages, group invites, and
-/// group messages -- any of the three can legitimately be the first thing
-/// a fresh Olm session ever carries, now that there's no dedicated
-/// handshake message type.
-fn olm_decrypt(crypto: &SharedCrypto, from: &PeerId, ciphertext: &str) -> Option<Vec<u8>> {
+/// Decrypt an Olm-encrypted payload from `from_identity_key`, creating an
+/// inbound session first if this is the first message we've ever received
+/// from that identity (a PreKeyMessage). Shared by direct messages, group
+/// invites, and group messages -- any of the three can legitimately be the
+/// first thing a fresh Olm session ever carries, now that there's no
+/// dedicated handshake message type.
+fn olm_decrypt(crypto: &SharedCrypto, from_identity_key: &str, ciphertext: &str) -> Option<Vec<u8>> {
     let olm_message = serde_json::from_str::<OlmMessage>(ciphertext).ok()?;
     let mut state = crypto.lock().unwrap();
-    if let Some(session) = state.inbound_olm_sessions.get_mut(from) {
+    if let Some(session) = state.inbound_olm_sessions.get_mut(from_identity_key) {
         return session.decrypt(&olm_message).ok();
     }
     let OlmMessage::PreKey(pre_key_message) = &olm_message else {
         return None;
     };
-    let identity_key = *state.peer_identity_keys.get(from)?;
+    let identity_key = Curve25519PublicKey::from_base64(from_identity_key).ok()?;
     let result = state
         .account
         .create_inbound_session(Default::default(), identity_key, pre_key_message)
         .ok()?;
-    state.inbound_olm_sessions.insert(from.clone(), result.session);
+    state
+        .inbound_olm_sessions
+        .insert(from_identity_key.to_string(), result.session);
     Some(result.plaintext)
+}
+
+/// Resolve a live peer_id's stable identity key, for handing off to
+/// `olm_decrypt`. Only meaningful for the three events still addressed by
+/// peer_id (`DirectMessage`/`GroupInvite`/`GroupMessage`) -- `InviteToGroup`
+/// already carries the sender's identity key directly.
+fn identity_key_for_peer(crypto: &SharedCrypto, peer_id: &PeerId) -> Option<String> {
+    crypto.lock().unwrap().peer_identity_keys.get(peer_id).map(|k| k.to_base64())
 }
 
 /// Decrypt a 1:1 chat message from `from`, returning (sender display name, text).
 fn handle_direct_message(crypto: &SharedCrypto, from: &PeerId, ciphertext: &str) -> Option<(String, String)> {
-    let plaintext = olm_decrypt(crypto, from, ciphertext)?;
+    let from_identity_key = identity_key_for_peer(crypto, from)?;
+    let plaintext = olm_decrypt(crypto, &from_identity_key, ciphertext)?;
     let text = String::from_utf8(plaintext).ok()?;
     let sender_name = crypto.lock().unwrap().peer_display_names.get(from).cloned()?;
     Some((sender_name, text))
 }
 
-/// Learn about a group we've been invited to (or re-invited to, on a
-/// reconnect), persisting its metadata. Returns the group's name, for a
-/// "you were added" notice, on success.
-fn handle_group_invite(crypto: &SharedCrypto, from: &PeerId, group_id: &GroupId, ciphertext: &str) -> Option<String> {
-    let plaintext = olm_decrypt(crypto, from, ciphertext)?;
+/// Learn about a group we've been invited to (or re-invited to, whether
+/// that's a reconnect or a fresh `invite_to_group` from someone), persisting
+/// its metadata. Returns the group's name, for a "you were added" notice,
+/// on success.
+fn handle_group_invite(crypto: &SharedCrypto, from_identity_key: &str, group_id: &GroupId, ciphertext: &str) -> Option<String> {
+    let plaintext = olm_decrypt(crypto, from_identity_key, ciphertext)?;
     let payload: GroupInvitePayload = serde_json::from_slice(&plaintext).ok()?;
 
     let data_dir = {
@@ -786,7 +940,8 @@ fn handle_group_message(
     group_id: &GroupId,
     ciphertext: &str,
 ) -> Option<(String, String, String)> {
-    let plaintext = olm_decrypt(crypto, from, ciphertext)?;
+    let from_identity_key = identity_key_for_peer(crypto, from)?;
+    let plaintext = olm_decrypt(crypto, &from_identity_key, ciphertext)?;
     let text = String::from_utf8(plaintext).ok()?;
     let state = crypto.lock().unwrap();
     let sender_name = state.peer_display_names.get(from).cloned()?;
@@ -1001,7 +1156,7 @@ mod tests {
 
         let encrypt_to_bob = |text: &str| {
             let mut state = alice.lock().unwrap();
-            let session = state.outbound_olm_sessions.get_mut("bob-peer").unwrap();
+            let session = state.outbound_olm_sessions.get_mut(&bob_info.identity_key).unwrap();
             let msg = session.encrypt(text.as_bytes()).unwrap();
             serde_json::to_string(&msg).unwrap()
         };
@@ -1022,7 +1177,7 @@ mod tests {
         // CryptoState doc comment on the two-map split).
         let reply = {
             let mut state = bob.lock().unwrap();
-            let session = state.outbound_olm_sessions.get_mut("alice-peer").unwrap();
+            let session = state.outbound_olm_sessions.get_mut(&alice_info.identity_key).unwrap();
             let msg = session.encrypt("hey alice".as_bytes()).unwrap();
             serde_json::to_string(&msg).unwrap()
         };
@@ -1058,11 +1213,11 @@ mod tests {
         // Alice invites Bob (but not Carol).
         let invite_ciphertext = {
             let mut state = alice.lock().unwrap();
-            let session = state.outbound_olm_sessions.get_mut("bob-peer").unwrap();
+            let session = state.outbound_olm_sessions.get_mut(&bob_info.identity_key).unwrap();
             let msg = session.encrypt(payload_json.as_bytes()).unwrap();
             serde_json::to_string(&msg).unwrap()
         };
-        let group_name = handle_group_invite(&bob, &"alice-peer".to_string(), &group_id, &invite_ciphertext)
+        let group_name = handle_group_invite(&bob, &alice_info.identity_key, &group_id, &invite_ciphertext)
             .expect("bob should learn about the group");
         assert_eq!(group_name, "Family");
         assert_eq!(bob.lock().unwrap().groups[&group_id].members.len(), 2);
@@ -1076,7 +1231,7 @@ mod tests {
         // Bob sends a group message; Alice (a member) can decrypt it.
         let bob_message_ciphertext = {
             let mut state = bob.lock().unwrap();
-            let session = state.outbound_olm_sessions.get_mut("alice-peer").unwrap();
+            let session = state.outbound_olm_sessions.get_mut(&alice_info.identity_key).unwrap();
             let msg = session.encrypt("hello family".as_bytes()).unwrap();
             serde_json::to_string(&msg).unwrap()
         };
@@ -1158,6 +1313,32 @@ mod tests {
         assert_eq!(groups[0].member_count, 2);
     }
 
+    #[test]
+    fn list_group_members_reports_identity_keys_and_is_empty_for_an_unknown_group() {
+        let client = ConnectClient::new(temp_data_dir());
+        let crypto = new_crypto("Alice");
+        {
+            let mut state = crypto.lock().unwrap();
+            state.groups.insert(
+                "group-1".to_string(),
+                persistence::GroupMetadata {
+                    name: "Family".to_string(),
+                    members: vec![
+                        persistence::GroupMember { identity_key: "a".into(), display_name: "Alice".into() },
+                        persistence::GroupMember { identity_key: "b".into(), display_name: "Bob".into() },
+                    ],
+                },
+            );
+        }
+        *client.crypto.lock().unwrap() = Some(crypto);
+
+        let mut members = client.list_group_members("group-1".to_string());
+        members.sort();
+        assert_eq!(members, vec!["a".to_string(), "b".to_string()]);
+
+        assert!(client.list_group_members("no-such-group".to_string()).is_empty());
+    }
+
     /// Regression guard for the `send_direct_message` signature change:
     /// resolving the target's live peer_id now happens at send time, and
     /// an unresolvable (offline) target must not silently drop the local
@@ -1186,6 +1367,139 @@ mod tests {
             &messages[0].conversation,
             Conversation::Direct { peer_identity_key } if peer_identity_key == "offline-bob-identity"
         ));
+    }
+
+    // -- invite_to_group ---------------------------------------------------
+    //
+    // The whole point of this method: it must work for a peer who isn't
+    // currently reachable, as long as we've discovered them at some point
+    // before (i.e. they show up in `list_known_peers()`). These tests
+    // simulate "known but offline right now" explicitly, by discovering a
+    // peer once via `handle_new_peer` and then removing only their
+    // peer_id-keyed mappings -- exactly what's left after they disconnect,
+    // now that Olm sessions are keyed by identity instead of peer_id.
+
+    #[test]
+    fn invite_to_group_sends_to_a_known_but_currently_offline_peer() {
+        let alice = new_crypto("Alice");
+        let carol = new_crypto("Carol");
+        let carol_info = announce(&carol, "carol-peer");
+
+        let listener = std::sync::Arc::new(TestListener::default());
+        let dyn_listener: std::sync::Arc<dyn ConnectClientListener> = listener.clone();
+        handle_new_peer(&alice, &dyn_listener, &carol_info); // met once, e.g. in an earlier session
+
+        {
+            let mut state = alice.lock().unwrap();
+            // Carol has since gone offline: no live peer_id for her
+            // anymore, but her known-peer record and outbound Olm session
+            // both persist.
+            state.peer_id_by_identity.remove(&carol_info.identity_key);
+            state.peer_identity_keys.remove(&carol_info.peer_id);
+            state.groups.insert(
+                "group-1".to_string(),
+                persistence::GroupMetadata {
+                    name: "Family".to_string(),
+                    members: vec![persistence::GroupMember {
+                        identity_key: "alice-identity-key".into(),
+                        display_name: "Alice".into(),
+                    }],
+                },
+            );
+        }
+
+        let client = ConnectClient::new(temp_data_dir());
+        *client.crypto.lock().unwrap() = Some(alice.clone());
+        let (tx, mut rx) = mpsc::unbounded_channel::<ClientEvent>();
+        *client.outgoing.lock().unwrap() = Some(tx);
+        *client.listener.lock().unwrap() = Some(dyn_listener);
+
+        let ok = client.invite_to_group("group-1".to_string(), carol_info.identity_key.clone());
+        assert!(ok, "inviting a known-but-offline peer should succeed");
+
+        assert_eq!(
+            alice.lock().unwrap().groups["group-1"].members.len(),
+            2,
+            "the new member should be persisted locally right away, not just sent over the wire"
+        );
+
+        match rx.try_recv() {
+            Ok(ClientEvent::InviteToGroup { to_identity_key, group_id, .. }) => {
+                assert_eq!(to_identity_key, carol_info.identity_key);
+                assert_eq!(group_id, "group-1");
+            }
+            other => panic!("expected InviteToGroup, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn invite_to_group_ciphertext_decrypts_to_the_updated_member_list() {
+        let alice = new_crypto("Alice");
+        let carol = new_crypto("Carol");
+        let alice_info = announce(&alice, "alice-peer");
+        let carol_info = announce(&carol, "carol-peer");
+        discover_each_other(&alice, &alice_info, &carol, &carol_info);
+
+        alice.lock().unwrap().groups.insert(
+            "group-1".to_string(),
+            persistence::GroupMetadata {
+                name: "Family".to_string(),
+                members: vec![persistence::GroupMember {
+                    identity_key: alice_info.identity_key.clone(),
+                    display_name: "Alice".into(),
+                }],
+            },
+        );
+
+        let client = ConnectClient::new(temp_data_dir());
+        *client.crypto.lock().unwrap() = Some(alice.clone());
+        let (tx, mut rx) = mpsc::unbounded_channel::<ClientEvent>();
+        *client.outgoing.lock().unwrap() = Some(tx);
+        *client.listener.lock().unwrap() =
+            Some(std::sync::Arc::new(TestListener::default()) as std::sync::Arc<dyn ConnectClientListener>);
+
+        assert!(client.invite_to_group("group-1".to_string(), carol_info.identity_key.clone()));
+
+        let ciphertext = match rx.try_recv() {
+            Ok(ClientEvent::InviteToGroup { ciphertext, .. }) => ciphertext,
+            other => panic!("expected InviteToGroup, got {other:?}"),
+        };
+
+        let group_name = handle_group_invite(&carol, &alice_info.identity_key, &"group-1".to_string(), &ciphertext)
+            .expect("carol should be able to decrypt the invite");
+        assert_eq!(group_name, "Family");
+        assert_eq!(carol.lock().unwrap().groups["group-1"].members.len(), 2);
+    }
+
+    #[test]
+    fn invite_to_group_refuses_to_double_invite_an_existing_member() {
+        let alice = new_crypto("Alice");
+        let carol = new_crypto("Carol");
+        let alice_info = announce(&alice, "alice-peer");
+        let carol_info = announce(&carol, "carol-peer");
+        discover_each_other(&alice, &alice_info, &carol, &carol_info);
+
+        alice.lock().unwrap().groups.insert(
+            "group-1".to_string(),
+            persistence::GroupMetadata {
+                name: "Family".to_string(),
+                members: vec![
+                    persistence::GroupMember { identity_key: alice_info.identity_key.clone(), display_name: "Alice".into() },
+                    persistence::GroupMember { identity_key: carol_info.identity_key.clone(), display_name: "Carol".into() },
+                ],
+            },
+        );
+
+        let client = ConnectClient::new(temp_data_dir());
+        *client.crypto.lock().unwrap() = Some(alice.clone());
+        let (tx, mut rx) = mpsc::unbounded_channel::<ClientEvent>();
+        *client.outgoing.lock().unwrap() = Some(tx);
+        *client.listener.lock().unwrap() =
+            Some(std::sync::Arc::new(TestListener::default()) as std::sync::Arc<dyn ConnectClientListener>);
+
+        let ok = client.invite_to_group("group-1".to_string(), carol_info.identity_key.clone());
+        assert!(!ok, "inviting an existing member should be refused");
+        assert!(rx.try_recv().is_err(), "nothing should be sent for a refused invite");
     }
 
     // -- WebSocket state machine (connect()'s retry/backoff loop) --------

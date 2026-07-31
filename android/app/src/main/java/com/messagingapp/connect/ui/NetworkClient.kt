@@ -68,11 +68,36 @@ class NetworkClient(context: Context) {
      * and invites each of them. Returns the new group's id, or `null` if
      * not connected or none of the member ids resolved to a known peer. */
     fun createGroup(name: String, memberPeerIds: List<String>): String? {
-        return client.createGroup(name, memberPeerIds)
+        val groupId = client.createGroup(name, memberPeerIds)
+        if (groupId != null) {
+            // Unlike invite_to_group, the Rust side doesn't emit a message
+            // back to the creator (only invitees get an "Added to group"
+            // notice), so nothing would otherwise trigger this refresh --
+            // the new group would stay invisible to this client's own UI
+            // (e.g. the Invites screen) until some unrelated message came
+            // in and refreshed it as a side effect.
+            groups = client.listGroups()
+        }
+        return groupId
     }
 
     fun sendGroupMessage(groupId: String, text: String) {
         client.sendGroupMessage(groupId, text)
+    }
+
+    /** Invites [peerIdentityKey] -- any known peer, online or offline -- to
+     * an existing group. Works even if they're not currently reachable:
+     * the relay server holds the invite until they next connect. Returns
+     * `false` if the group doesn't exist, they're already a member, or
+     * we've never discovered that identity before. */
+    fun inviteToGroup(groupId: String, peerIdentityKey: String): Boolean {
+        return client.inviteToGroup(groupId, peerIdentityKey)
+    }
+
+    /** Identity keys of [groupId]'s current members, for filtering an
+     * "invite someone" list down to people who aren't already in it. */
+    fun groupMembers(groupId: String): List<String> {
+        return client.listGroupMembers(groupId)
     }
 
     fun disconnect() {

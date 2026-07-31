@@ -52,6 +52,12 @@ pub enum ClientEvent {
     /// An Olm-encrypted group chat message, addressed to one member at a
     /// time -- sending to a group of N means N of these, one per member.
     GroupMessage { to: PeerId, group_id: GroupId, ciphertext: String },
+    /// Invite an existing group's new member by their stable identity key
+    /// rather than a live `PeerId` -- unlike `GroupInvite`, this works
+    /// whether the invitee is currently online (the server delivers it
+    /// right away) or offline (the server holds it in memory and delivers
+    /// it the moment that identity next joins).
+    InviteToGroup { to_identity_key: String, group_id: GroupId, ciphertext: String },
 }
 
 /// Messages sent from the server to a client.
@@ -65,4 +71,10 @@ pub enum ServerEvent {
     DirectMessage { from: PeerId, ciphertext: String },
     GroupInvite { from: PeerId, group_id: GroupId, ciphertext: String },
     GroupMessage { from: PeerId, group_id: GroupId, ciphertext: String },
+    /// Delivery of an `InviteToGroup`, addressed by the sender's stable
+    /// identity key rather than a `PeerId` -- by the time this is
+    /// delivered the sender may well have disconnected (that's the whole
+    /// point: this is how an invite reaches someone who was offline when
+    /// it was sent), so there's no live peer_id to attribute it to.
+    InviteToGroup { from_identity_key: String, group_id: GroupId, ciphertext: String },
 }

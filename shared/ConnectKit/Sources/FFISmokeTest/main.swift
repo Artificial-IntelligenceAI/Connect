@@ -13,7 +13,7 @@
 // identity (test persistence), a different tag gets a fresh one (test
 // the key-changed warning by reusing a displayName with a different tag).
 //
-// Usage: swift run FFISmokeTest [displayName] [host] [port] [dataDirTag] [sendToDisplayName] [sendToText]
+// Usage: swift run FFISmokeTest [displayName] [host] [port] [dataDirTag] [sendToDisplayName] [sendToText] [stayAliveSeconds]
 
 import Foundation
 import MessagingCore
@@ -44,8 +44,12 @@ let displayName = args.count > 1 ? args[1] : "FFISmokeTest"
 let host = args.count > 2 ? args[2] : "127.0.0.1"
 let port = args.count > 3 ? UInt16(args[3]) ?? 7878 : 7878
 let dataDirTag = args.count > 4 ? args[4] : displayName
-let sendToDisplayName = args.count > 5 ? args[5] : nil
-let sendToText = args.count > 6 ? args[6] : nil
+// An empty string for either of these positional args means "not set" --
+// lets a caller supply stayAliveSeconds (arg 8) without also being forced
+// to trigger the send path.
+let sendToDisplayName = (args.count > 5 && !args[5].isEmpty) ? args[5] : nil
+let sendToText = (args.count > 6 && !args[6].isEmpty) ? args[6] : nil
+let stayAliveSeconds = args.count > 7 ? Double(args[7]) ?? 4.0 : 4.0
 
 let dataDir = FileManager.default.temporaryDirectory
     .appendingPathComponent("ConnectSmokeTest", isDirectory: true)
@@ -80,7 +84,7 @@ if let sendToDisplayName, let sendToText {
 } else {
     // Stay alive so any other instance connecting concurrently shows up as
     // a PeerJoined/TOFU notice above.
-    Thread.sleep(forTimeInterval: 4.0)
+    Thread.sleep(forTimeInterval: stayAliveSeconds)
 }
 client.disconnect()
 print("done")

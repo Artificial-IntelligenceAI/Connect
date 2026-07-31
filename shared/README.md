@@ -410,6 +410,91 @@ backend (both platforms) and is deliberately out of scope here.
   whether the app is mid-reconnect rather than assuming the notification
   code itself is broken.
 
+## Inviting offline peers to a group (`invite_to_group`, the "Invites" screen)
+
+A new sidebar button (envelope icon, next to the gear) opens an "Invites"
+screen: pick one of your existing groups, then pick any *known* peer --
+online or offline -- to add to it. This is deliberately separate from the
+"+" new-group flow, which is untouched and still only offers currently-
+online peers at creation time; this is specifically for adding someone to
+a group that already exists, including someone who isn't reachable right
+now.
+
+Making this work for an offline target needed real protocol and crypto
+changes, not just a new screen:
+
+- **The relay server gained a small in-memory mailbox.** Previously the
+  server was a pure, stateless real-time relay -- if you weren't
+  connected, nothing was ever queued for you, full stop. A new
+  `ClientEvent::InviteToGroup { to_identity_key, group_id, ciphertext }`
+  is addressed by the invitee's stable identity key (which `Join` already
+  sends, unlike `PeerId`-addressed events) rather than a live `PeerId`.
+  The server checks whether that identity is currently connected: if so,
+  it delivers `ServerEvent::InviteToGroup { from_identity_key, .. }`
+  immediately; if not, it holds the invite in
+  `AppState.pending_invites: HashMap<identity_key, Vec<PendingInvite>>`
+  and flushes it the moment that identity's owner next sends `Join`. Like
+  everything else on this relay, the mailbox is **in-memory only** --
+  restarting the server drops anything still pending, same as it drops
+  every other bit of state.
+- **Olm sessions had to stop being keyed by `PeerId`.** This was the real
+  prerequisite, not just plumbing: a `PeerId` is only valid for one
+  connection's lifetime (the server hands out a fresh one every time), so
+  encrypting something for a peer who isn't online *right now* was
+  previously impossible even in principle -- there was no live `PeerId`
+  to look up a session under. `outbound_olm_sessions`/`inbound_olm_sessions`
+  in `CryptoState` are now keyed by base64 identity key instead. A useful
+  side effect: `reset_peer_state` (called on every reconnect) no longer
+  clears sessions at all, since they're not tied to the churning
+  `PeerId` anymore -- conversations survive a reconnect instead of
+  silently re-handshaking, closing a previously-documented v1 limitation.
+  Sessions still only live in memory, though -- a full app restart (not
+  just a reconnect) still loses them, since only the long-term `Account`
+  is persisted to disk.
+- **`ConnectClient::invite_to_group(group_id, peer_identity_key) -> bool`**
+  requires an existing outbound Olm session with that identity -- i.e.
+  they must already be a "known peer" you've discovered through the relay
+  at some point. It builds the *updated* member list (existing members +
+  the new invitee) up front so the payload the invitee receives actually
+  includes them, persists that membership locally immediately (so it
+  survives even if you disconnect before the invite is actually
+  delivered), and sends it via the identity-addressed event. A local
+  "Invited X to \"group\"" system notice confirms it on the sender's side.
+- **`ConnectClient::list_group_members(group_id) -> Vec<String>`** (new)
+  exposes a group's current member identity keys, needed to filter the
+  Invites screen's peer list down to people not already in the group --
+  `list_groups()`'s `GroupSummary` only ever had a member *count*.
+
+**Two real bugs found during verification, not theorized:**
+1. My first draft of `invite_to_group` built the invite payload from the
+   *current* member list before appending the new invitee -- so the
+   person being invited never actually learned they were in the group.
+   Caught by a dedicated test asserting the recipient's decrypted member
+   list includes themselves, not just by manual testing.
+2. After `create_group` succeeds, the *creator's* own `groups` list
+   never refreshed on either platform -- `create_group` only notifies
+   invitees (via their "Added to group" message), not the creator, so
+   nothing ever re-called `listGroups()` on the creator's side. This bug
+   predates this pass entirely (the existing "GC" filter view had the
+   same gap) but was invisible until the new Invites screen made it
+   block-obvious: a just-created group didn't show up to invite anyone
+   to. Fixed by having `NetworkClient.createGroup`/`inviteToGroup`'s
+   Kotlin/Swift wrappers refresh `groups` immediately after a successful
+   `createGroup` call, on both platforms.
+
+**Verified fully end-to-end on real hardware**, not just the automated
+test suite: a real Android device created a group with one online
+`FFISmokeTest` peer, invited a *second*, already-offline peer through the
+new Invites screen (confirmed via the "Invited ... to ..." notice and the
+peer correctly disappearing from the invitable list), and that second
+peer -- reconnecting fresh, independently, no longer even knowing it had
+been invited -- immediately received "Added to group \"TestGroup\"" the
+moment it rejoined. Also verified: a mid-verification attempt correctly
+returned `false`/sent nothing when the invitee's identity had never been
+seen live in the *current* process's session (Olm sessions are in-memory
+only, per the limitation above) -- confirms the online-encounter
+prerequisite is real, not just documented.
+
 ## Identity persistence and verification (`core/src/persistence.rs`)
 
 `ConnectClient::new(dataDir)` takes a platform-supplied, writable,

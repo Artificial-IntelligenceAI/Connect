@@ -59,6 +59,7 @@ public struct ContentView: View {
     @State private var selectedConversation: SelectedConversation?
     @State private var showingCreateGroup = false
     @State private var showingSettings = false
+    @State private var showingInvites = false
 
     public init() {}
 
@@ -144,6 +145,13 @@ public struct ContentView: View {
                     .clipShape(RoundedRectangle(cornerRadius: 6))
             }
             Button {
+                showingInvites = true
+            } label: {
+                Image(systemName: "envelope.badge")
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(Solarized.base01)
+            Button {
                 showingSettings = true
             } label: {
                 Image(systemName: "gearshape")
@@ -157,6 +165,9 @@ public struct ContentView: View {
         .background(Solarized.base2)
         .sheet(isPresented: $showingSettings) {
             SettingsView(settings: settings)
+        }
+        .sheet(isPresented: $showingInvites) {
+            InvitesView(client: client)
         }
     }
 
@@ -410,6 +421,117 @@ private struct SettingsView: View {
         .padding(20)
         .frame(width: 300, height: 220)
         .background(Solarized.base3)
+    }
+}
+
+/// Invite an existing group's new member -- online *or* offline, unlike
+/// the "+" new-group flow above, which only ever offers currently-online
+/// peers at creation time. Pick a group, then pick any known peer not
+/// already in it; the invite is sent via `ConnectClient.inviteToGroup`,
+/// which the relay server delivers right away if they're online or holds
+/// until they next join if they're not.
+private struct InvitesView: View {
+    @ObservedObject var client: NetworkClient
+    @State private var selectedGroup: GroupSummary?
+
+    var body: some View {
+        VStack(spacing: 0) {
+            header
+            if let group = selectedGroup {
+                invitablePeerList(for: group)
+            } else {
+                groupList
+            }
+        }
+        .frame(width: 320, height: 380)
+        .background(Solarized.base3)
+    }
+
+    private var header: some View {
+        HStack {
+            if selectedGroup != nil {
+                Button {
+                    selectedGroup = nil
+                } label: {
+                    Label("Back", systemImage: "chevron.left")
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(Solarized.blue)
+            }
+            Spacer()
+            Text(selectedGroup?.name ?? "Invite to a Group")
+                .font(.headline)
+                .foregroundStyle(Solarized.base01)
+            Spacer()
+            if selectedGroup != nil {
+                Color.clear.frame(width: 44) // balances the back button so the title stays centered
+            }
+        }
+        .padding(12)
+        .background(Solarized.base2)
+    }
+
+    private var groupList: some View {
+        Group {
+            if client.groups.isEmpty {
+                Spacer()
+                Text("No groups yet -- create one first with the + button.")
+                    .font(.caption)
+                    .foregroundStyle(Solarized.base1)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 24)
+                Spacer()
+            } else {
+                List(client.groups, id: \.groupId) { group in
+                    Button {
+                        selectedGroup = group
+                    } label: {
+                        HStack {
+                            Text(group.name).foregroundStyle(Solarized.base01)
+                            Spacer()
+                            Text("\(group.memberCount) member\(group.memberCount == 1 ? "" : "s")")
+                                .font(.caption)
+                                .foregroundStyle(Solarized.base1)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                }
+                .listStyle(.plain)
+            }
+        }
+    }
+
+    private func invitablePeerList(for group: GroupSummary) -> some View {
+        let currentMembers = Set(client.groupMembers(groupId: group.groupId))
+        let invitablePeers = client.knownPeers.filter { !currentMembers.contains($0.identityKey) }
+
+        return Group {
+            if invitablePeers.isEmpty {
+                Spacer()
+                Text("Everyone you know is already in this group.")
+                    .font(.caption)
+                    .foregroundStyle(Solarized.base1)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 24)
+                Spacer()
+            } else {
+                List(invitablePeers, id: \.identityKey) { peer in
+                    Button {
+                        client.inviteToGroup(groupId: group.groupId, peerIdentityKey: peer.identityKey)
+                    } label: {
+                        HStack {
+                            Text(peer.displayName).foregroundStyle(Solarized.base01)
+                            Spacer()
+                            Text(peer.peerId != nil ? "online" : "offline")
+                                .font(.caption)
+                                .foregroundStyle(Solarized.base1)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                }
+                .listStyle(.plain)
+            }
+        }
     }
 }
 
